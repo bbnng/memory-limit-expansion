@@ -212,12 +212,17 @@ static BOOL enum_process_modules(HMODULE *mods, DWORD cb, DWORD *needed) {
 }
 
 // Redirects functions in every loaded module's import table (except the system's own allocator and
-// loader DLLs) and in kernel32's and kernelbase's export tables, so modules loaded later get them too.
+// loader DLLs). Deliberately leaves kernel32/kernelbase's export tables untouched: patching
+// kernel32's LoadLibrary* exports poisons GetProcAddress(kernel32, "LoadLibraryW"), which breaks
+// Steam Overlay (gameoverlayrenderer.dll) and other tools that inject into child processes via
+// CreateRemoteThread(..., GetProcAddress(kernel32, "LoadLibraryW"), ...). Vampire.exe (LoadLibraryExA)
+// and launcher.dll (LoadLibraryA) are already loaded here so their IAT slots catch DONT_RESOLVE_DLL_REFERENCES
+// mappings, while normal LoadLibrary calls from later modules fire LdrRegisterDllNotification.
 int redirect_imports(const char *const *names, void **originals, void *const *replacements, int n) {
     Redirect list[32];
     void *kb_orig[16] = {};
     if (n > 16) n = 16;
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll"), kb = GetModuleHandleW(L"kernelbase.dll");
+    HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
     int count = 0;
     for (int i = 0; i < n; ++i) {
         list[count++] = {names[i], replacements[i], &originals[i]};
@@ -239,10 +244,6 @@ int redirect_imports(const char *const *names, void **originals, void *const *re
             if (!_wcsicmp(base, L"ntdll.dll") || !_wcsicmp(base, L"kernel32.dll") || !_wcsicmp(base, L"kernelbase.dll")) continue;
             patched += patch_module_imports(mods[i], list, count);
         }
-    for (int i = 0; i < n; ++i) {
-        patch_export_rva(k32, names[i], replacements[i]);
-        if (kb) patch_export_rva(kb, names[i], replacements[i]);
-    }
     return patched;
 }
 

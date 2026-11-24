@@ -11,6 +11,7 @@
 // Console commands arrive on a named pipe (\\.\pipe\vtmb-memx-<name>, -memx_pipe <name>, default
 // "server"), one command per line, and are run between frames.
 #include "common.h"
+#include "split_load_watch.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -312,6 +313,86 @@ static void install_null_client() {
     *slot = &s_null_client;
 }
 
+// ---- what the engine still has to do for a level command (split_load_watch.h) ----
+static const uintptr_t kCbufSize = 0x20346930;    // bytes waiting in the command buffer
+static const uintptr_t kHostState = 0x20D5E0B0;   // CHostState: +0 current state, +4 next state
+static bool s_load_watch_ok;   // the two are where the analysed engine.dll has them; without them no failure is reported
+static void check_load_watch(HMODULE engine) {
+    // Cbuf_Execute: sub esp,400h; push ebx,ebp; mov ebp,[20346930]; xor ebx,ebx; cmp ebp,ebx
+    static const BYTE kCbufExecute[] = {0x81, 0xEC, 0x00, 0x04, 0x00, 0x00, 0x53, 0x55, 0x8B, 0x2D, 0x30, 0x69, 0x34, 0x20, 0x33, 0xDB, 0x3B, 0xEB};
+    // HostState_GameShutdown: cmp [20D5E0B0],4; jz; mov eax,5; mov [20D5E0B0],eax; mov [20D5E0B4],eax
+    static const BYTE kGameShutdown[] = {0x83, 0x3D, 0xB0, 0xE0, 0xD5, 0x20, 0x04, 0x74, 0x10, 0xB8, 0x05, 0x00, 0x00, 0x00,
+                                         0xA3, 0xB0, 0xE0, 0xD5, 0x20, 0xA3, 0xB4, 0xE0, 0xD5, 0x20};
+    s_load_watch_ok = in_module_image(engine, 0x2DF10, sizeof(kCbufExecute)) && in_module_image(engine, 0x9A670, sizeof(kGameShutdown)) &&
+                      memcmp((const BYTE *)engine + 0x2DF10, kCbufExecute, sizeof(kCbufExecute)) == 0 &&
+                      memcmp((const BYTE *)engine + 0x9A670, kGameShutdown, sizeof(kGameShutdown)) == 0;
+    if (!s_load_watch_ok) log("server: failed level commands are not reported (unknown engine code)");
+}
+
+// Client-side level-transition plugins (e.g. CaineWorld) are loaded into the headless server process
+// too by the UP loader and hook IVEngineServer::ChangeLevel (VEngineServer014 slot 9, engine+0x186EA0),
+// deferring the transition until Present() finishes a fade. Present() never runs in a dedicated server,
+// so every door / level transition would be swallowed forever. Restore engine.dll's ChangeLevel slot in
+// the server process (BLSE hooks ChangeLevel inline at engine+0x108A50, so BLSE still receives every call).
+static void **s_changelevel_slot = nullptr;
+static void *s_changelevel_orig = nullptr;
+static int s_changelevel_restores = 0;
+static char s_changelevel_logged[MAX_PATH] = {};
+static void init_changelevel_guard(HMODULE engine) {
+    s_changelevel_slot = nullptr;
+    s_changelevel_orig = nullptr;
+    s_changelevel_restores = 0;
+    s_changelevel_logged[0] = 0;
+    static const BYTE kChangeLevelHead[] = {0xA1, 0xD0, 0xF1, 0x2A, 0x21, 0x3B, 0x05, 0x20, 0xF5, 0x38, 0x21, 0x74, 0x41};
+    if (engine == (HMODULE)0x20000000 && in_module_image(engine, 0x186EA0, 4) &&
+        in_module_image(engine, 0x108A50, sizeof(kChangeLevelHead)) &&
+        memcmp((const BYTE *)engine + 0x108A50, kChangeLevelHead, sizeof(kChangeLevelHead)) == 0) {
+        s_changelevel_slot = (void **)((BYTE *)engine + 0x186EA0);
+        s_changelevel_orig = (void *)((BYTE *)engine + 0x108A50);
+    } else {
+        log("server: IVEngineServer::ChangeLevel head bytes do not match engine.dll 1.2; guard disabled");
+    }
+}
+static bool safe_restore_slot(void **slot, void *orig) {
+    DWORD prot = 0;
+    if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &prot)) return false;
+    bool ok = false;
+    __try {
+        InterlockedExchangePointer(slot, orig);
+        ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    VirtualProtect(slot, sizeof(void *), prot, &prot);
+    if (ok) FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void *));
+    return ok;
+}
+static void restore_changelevel_if_hooked() {
+    if (!s_changelevel_slot || !s_changelevel_orig || s_changelevel_restores >= 10) return;
+    void *cur = *(void *volatile *)s_changelevel_slot;
+    if (cur == s_changelevel_orig) return;
+    HMODULE mod = nullptr;
+    char modname[MAX_PATH] = "unknown";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)cur, &mod) && mod) {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(mod, path, MAX_PATH)) {
+            const char *base = strrchr(path, '\\');
+            snprintf(modname, sizeof(modname), "%s", base ? base + 1 : path);
+        }
+        if (!_stricmp(modname, "engine.dll") || !_stricmp(modname, "blse.vtm")) return;
+    }
+    if (safe_restore_slot(s_changelevel_slot, s_changelevel_orig)) {
+        ++s_changelevel_restores;
+        if (_stricmp(s_changelevel_logged, modname) != 0) {
+            snprintf(s_changelevel_logged, sizeof(s_changelevel_logged), "%s", modname);
+            log("server: restored IVEngineServer::ChangeLevel (was hooked by %s; client transition hooks cannot run headless)", modname);
+        }
+        if (s_changelevel_restores == 10)
+            log("server: IVEngineServer::ChangeLevel kept being re-hooked by %s; stopping restore retries", modname);
+    }
+}
+
 // ---- the launcher interface, replaced ----
 struct LauncherAPI {
     // CEngineAPI::Run(instance, basedir, cmdline, factory); a true result asks the launcher to restart
@@ -361,6 +442,7 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
     }
     install_spew_tap();
     install_null_client();
+    restore_changelevel_if_hooked();
     // The Unofficial Patch loader tells its plugins when the engine loads the DLLs a game with a window
     // loads after vampire.dll (StudioRender, GameUI, the sound DLL, client.dll), and BLSE installs its game
     // hooks (game events, level changes, game frames, its console commands) at those calls. A dedicated
@@ -393,9 +475,8 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
     int paused = 0;
     int last_seq = -1;
     DWORD last_active = 0;
-    bool load_cmd_pending = false;
-    int load_cmd_spawn = -1;
-    int load_cmd_frames = 0;
+    LoadWatch load_watch;
+    long load_id = 0;   // the game's number for the level command that follows ("memx:loadid")
     for (;;) {
         if (s_stdout && s_stdout_broken) {
             log("server: game process stdout pipe closed; shutting down");
@@ -421,6 +502,10 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
                     got_gamecmds = true;
                     continue;
                 }
+                if (c.rfind("memx:loadid ", 0) == 0) {
+                    load_id = atol(c.c_str() + 12);
+                    continue;
+                }
                 // the game's aliases come before every new game or load (split_client.cpp): not logged one by one
                 if (c.rfind("alias ", 0) != 0) log("server: > %s", c.c_str());
                 const char *trimmed = c.c_str();
@@ -433,13 +518,9 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
                     void *sr = *(void *volatile *)0x201A44E8;
                     if (sr && (*(void ***)sr)[8] == (void *)0x20098CB0) ((void(__fastcall *)(void *, void *))(*(void ***)sr)[8])(sr, nullptr);
                 }
-                if (!_strnicmp(trimmed, "map ", 4) || !_strnicmp(trimmed, "load ", 5) ||
-                    !_strnicmp(trimmed, "changelevel ", 12) || !_stricmp(trimmed, "reload") ||
-                    !_strnicmp(trimmed, "reload ", 7) || !_stricmp(trimmed, "restart") ||
-                    !_strnicmp(trimmed, "restart ", 8)) {
-                    load_cmd_pending = true;
-                    load_cmd_spawn = *(volatile int *)0x212AF1D0;
-                    load_cmd_frames = 0;
+                if (s_load_watch_ok && is_level_command(trimmed)) {
+                    load_watch.begin(load_id, *(volatile int *)0x212AF1D0);
+                    load_id = 0;
                 }
                 c += '\n';
                 hlds->AddConsoleText(c.c_str());
@@ -452,6 +533,7 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
         // engine code the game calls on the server reads it too (GetLightForPoint, used for how lit the
         // player is). Here it is the server's map (sv.worldmodel, 0x212B0828).
         *(void *volatile *)0x20B42AEC = *(void *volatile *)0x212B0828;
+        restore_changelevel_if_hooked();
         tune_engine_sockets();
         s_loop_step = "a world frame (RunFrame)";
         if (!hlds->RunFrame()) break;
@@ -462,16 +544,18 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
         int spawn = *(volatile int *)0x212AF1D0;
         if (sv_active && spawn != reported) {
             reported = spawn;
-            load_cmd_pending = false;
             char line[160];
             snprintf(line, sizeof(line), "memx:ready %d %.120s\n", spawn, (const char *)0x212B07E8);
             status_write(line);
-        } else if (load_cmd_pending) {
-            if (++load_cmd_frames >= 2 && spawn == load_cmd_spawn) {
-                load_cmd_pending = false;
-                log("server: map/load command did not spawn a level (sv_active=%d, spawn=%d); notifying game", sv_active, spawn);
-                status_write("memx:loadfailed\n");
-            }
+        }
+        // the game waits on its loading screen: tell it when the level it asked for will not come
+        if (load_watch.pending &&
+            load_watch.failed(*(volatile int *)kCbufSize == 0, *(volatile int *)kHostState, *(volatile int *)(kHostState + 4),
+                              sv_active != 0, spawn, GetTickCount())) {
+            log("server: level command %ld did not start a level (sv_active=%d, spawn=%d); notifying the game", load_watch.id, sv_active, spawn);
+            char line[48];
+            snprintf(line, sizeof(line), "memx:loadfailed %ld\n", load_watch.id);
+            status_write(line);
         }
         // sv.paused (0x212B0758): the game's menu and interface screens pause the world
         int sv_paused = *(volatile int *)0x212B0758;
@@ -1299,6 +1383,8 @@ void on_engine_mapped(HMODULE engine) {
     // Sys_Error: call _printf (0x200FA31A) -> server_fatal_print
     redirect_call(engine, 0xFA31A, 0x164458, (void *)server_fatal_print, "Sys_Error message");
 
+    check_load_watch(engine);
+    init_changelevel_guard(engine);
     install_message_box_guard();
     static bool veh;
     if (!veh) veh = AddVectoredExceptionHandler(1, on_exception) != nullptr;

@@ -135,6 +135,14 @@ struct VtEntry {
 static std::vector<VtEntry *> g_vts[VT_KINDS];
 static std::atomic<VtEntry *> g_vt_primary[VT_KINDS];
 static SRWLOCK g_vt_lock = SRWLOCK_INIT;
+static HMODULE g_d3d9_mod = nullptr;
+
+static bool in_d3d9_module(void *fn) {
+    if (!fn || !g_d3d9_mod) return false;
+    HMODULE mod = nullptr;
+    return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              (LPCSTR)fn, &mod) && mod == g_d3d9_mod;
+}
 
 static VtEntry *vt_entry_locked(VtKind kind, void **vt, bool create) {
     for (VtEntry *e : g_vts[kind])
@@ -149,7 +157,7 @@ static VtEntry *vt_entry_locked(VtKind kind, void **vt, bool create) {
     return e;
 }
 
-static void hook(VtKind kind, void *obj, int index, void *fn) {
+static void hook(VtKind kind, void *obj, int index, void *fn, bool initial = false) {
     if (index < 0 || index >= 128) return;
     void **vt = *(void ***)obj;
     VtEntry *p = g_vt_primary[kind].load(std::memory_order_acquire);
@@ -165,10 +173,16 @@ static void hook(VtKind kind, void *obj, int index, void *fn) {
             }
         }
     } else {
-        // Unhooked slot, reused heap vtable address (device recreation), or runtime vtable rewrite
-        // (e.g. BeginStateBlock/EndStateBlock): re-patch and refresh the stored original.
-        void *old = patch_vtable(vt, index, fn);
-        if (old && old != fn) e->orig[index].store(old, std::memory_order_release);
+        void *cur = vt[index];
+        void *cur_orig = e->orig[index].load(std::memory_order_relaxed);
+        // Only overwrite a previously hooked slot on fresh device creation (initial=true) or when
+        // d3d9 itself rewrote the vtable (BeginStateBlock/EndStateBlock/Reset). If another mod or
+        // overlay (e.g. CaineWorld, CaineHud, Steam overlay) hooked this slot after us, its hook
+        // already chains into our `fn`; replacing it and storing it in `orig` causes infinite recursion.
+        if (initial || !cur_orig || cur == cur_orig || in_d3d9_module(cur)) {
+            void *old = patch_vtable(vt, index, fn);
+            if (old && old != fn) e->orig[index].store(old, std::memory_order_release);
+        }
     }
     ReleaseSRWLockExclusive(&g_vt_lock);
 }
@@ -1048,8 +1062,20 @@ static Res *new_res(VtKind kind, IDirect3DDevice9 *dev, D3DFORMAT format, UINT l
     return r;
 }
 
+static std::atomic<IDirect3DDevice9 *> s_lifecycle_pending{nullptr};
+static std::atomic<void *> s_raw_reset{nullptr};
+static std::atomic<void *> s_raw_present{nullptr};
+static void hook_device(IDirect3DDevice9 *dev);
+static void hook_device_core(IDirect3DDevice9 *dev, bool initial);
+static void __declspec(noinline) hook_device_lifecycle(IDirect3DDevice9 *dev);
+static __forceinline void ensure_lifecycle_hooks(IDirect3DDevice9 *dev) {
+    if (s_lifecycle_pending.load(std::memory_order_relaxed) == dev)
+        hook_device_lifecycle(dev);
+}
+
 static HRESULT WINAPI Dev_CreateTexture(IDirect3DDevice9 *dev, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT format,
                                         D3DPOOL pool, IDirect3DTexture9 **out, HANDLE *shared) {
+    ensure_lifecycle_hooks(dev);
     auto create = orig<CreateTexture_t>(VT_DEV, dev, D_CREATETEXTURE);
     if (pool != D3DPOOL_MANAGED || !s_device_ex) return create(dev, w, h, levels, usage, format, pool, out, shared);
     HRESULT hr = create(dev, w, h, levels, usage, format, D3DPOOL_DEFAULT, out, shared);
@@ -1084,6 +1110,7 @@ static HRESULT WINAPI Dev_CreateTexture(IDirect3DDevice9 *dev, UINT w, UINT h, U
 
 static HRESULT WINAPI Dev_CreateCubeTexture(IDirect3DDevice9 *dev, UINT edge, UINT levels, DWORD usage, D3DFORMAT format,
                                             D3DPOOL pool, IDirect3DCubeTexture9 **out, HANDLE *shared) {
+    ensure_lifecycle_hooks(dev);
     auto create = orig<CreateCubeTexture_t>(VT_DEV, dev, D_CREATECUBE);
     if (pool != D3DPOOL_MANAGED || !s_device_ex) return create(dev, edge, levels, usage, format, pool, out, shared);
     HRESULT hr = create(dev, edge, levels, usage, format, D3DPOOL_DEFAULT, out, shared);
@@ -1117,14 +1144,22 @@ static HRESULT WINAPI Dev_CreateCubeTexture(IDirect3DDevice9 *dev, UINT edge, UI
 
 static HRESULT WINAPI Dev_CreateVolumeTexture(IDirect3DDevice9 *dev, UINT w, UINT h, UINT depth, UINT levels, DWORD usage,
                                               D3DFORMAT format, D3DPOOL pool, IDirect3DVolumeTexture9 **out, HANDLE *shared) {
+    ensure_lifecycle_hooks(dev);
     auto create = orig<CreateVolumeTexture_t>(VT_DEV, dev, D_CREATEVOLUME);
     if (pool != D3DPOOL_MANAGED || !s_device_ex) return create(dev, w, h, depth, levels, usage, format, pool, out, shared);
     // The Ex device has no managed pool at all, so this conversion is needed even with offloading off.
     IDirect3DVolumeTexture9 *shadow = nullptr;
     HRESULT hr = create(dev, w, h, depth, levels, 0, format, D3DPOOL_SYSTEMMEM, &shadow, nullptr);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) {
+        if (++s_create_fail <= 10) log("CreateVolumeTexture %ux%ux%u format %08x shadow failed %08lx", w, h, depth, format, hr);
+        return hr;
+    }
     hr = create(dev, w, h, depth, levels, usage, format, D3DPOOL_DEFAULT, out, shared);
-    if (FAILED(hr)) { shadow->Release(); return hr; }
+    if (FAILED(hr)) {
+        shadow->Release();
+        if (++s_create_fail <= 10) log("CreateVolumeTexture %ux%ux%u format %08x in video memory failed %08lx", w, h, depth, format, hr);
+        return hr;
+    }
     IDirect3DVolumeTexture9 *t = *out;
     hook(VT_VOL, t, T_RELEASE, (void *)Vol_Release);
     hook(VT_VOL, t, T_LOCK, (void *)Vol_LockBox);
@@ -1142,6 +1177,7 @@ static HRESULT WINAPI Dev_CreateVolumeTexture(IDirect3DDevice9 *dev, UINT w, UIN
 
 static HRESULT WINAPI Dev_CreateVertexBuffer(IDirect3DDevice9 *dev, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
                                              IDirect3DVertexBuffer9 **out, HANDLE *shared) {
+    ensure_lifecycle_hooks(dev);
     auto create = orig<CreateVertexBuffer_t>(VT_DEV, dev, D_CREATEVB);
     if (pool != D3DPOOL_MANAGED || !s_device_ex) return create(dev, length, usage, fvf, pool, out, shared);
     if (!g_settings.offload_buffers) return create(dev, length, usage, fvf, D3DPOOL_SYSTEMMEM, out, shared);
@@ -1169,6 +1205,7 @@ static HRESULT WINAPI Dev_CreateVertexBuffer(IDirect3DDevice9 *dev, UINT length,
 
 static HRESULT WINAPI Dev_CreateIndexBuffer(IDirect3DDevice9 *dev, UINT length, DWORD usage, D3DFORMAT format, D3DPOOL pool,
                                             IDirect3DIndexBuffer9 **out, HANDLE *shared) {
+    ensure_lifecycle_hooks(dev);
     auto create = orig<CreateIndexBuffer_t>(VT_DEV, dev, D_CREATEIB);
     if (pool != D3DPOOL_MANAGED || !s_device_ex) return create(dev, length, usage, format, pool, out, shared);
     if (!g_settings.offload_buffers) return create(dev, length, usage, format, D3DPOOL_SYSTEMMEM, out, shared);
@@ -1204,11 +1241,11 @@ static std::atomic<long> s_present_codes{0};
 static std::atomic<bool> s_need_reset{false};
 
 static HRESULT WINAPI Dev_TestCooperativeLevel(IDirect3DDevice9 *dev) {
+    ensure_lifecycle_hooks(dev);
     if (s_need_reset.load(std::memory_order_relaxed)) return D3DERR_DEVICENOTRESET;
     return orig<TestCoop_t>(VT_DEV, dev, D_TESTCOOP)(dev);
 }
 
-static void hook_device(IDirect3DDevice9 *dev);
 static UINT s_adapter = D3DADAPTER_DEFAULT;
 
 static D3DFORMAT strip_alpha_format(D3DFORMAT fmt) {
@@ -1233,6 +1270,12 @@ static D3DDISPLAYMODEEX build_fullscreen_mode(const D3DPRESENT_PARAMETERS *pp, I
 }
 
 static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *dev, const RECT *a, const RECT *b, HWND w, const RGNDATA *d) {
+    static __declspec(thread) bool t_in_present = false;
+    if (t_in_present) {
+        if (auto raw = (Present_t)s_raw_present.load(std::memory_order_acquire)) return raw(dev, a, b, w, d);
+        return D3D_OK;
+    }
+    struct Guard { bool &f; Guard(bool &b) : f(b) { f = true; } ~Guard() { f = false; } } guard(t_in_present);
     if (s_device_ex.load(std::memory_order_relaxed) && (*(void ***)dev)[D_CREATETEXTURE] != (void *)Dev_CreateTexture)
         hook_device(dev);
     if (s_need_reset.load(std::memory_order_relaxed)) return D3DERR_DEVICELOST;
@@ -1276,6 +1319,7 @@ typedef HRESULT(WINAPI *DrawIndexedPrimitiveUP_t)(IDirect3DDevice9 *, D3DPRIMITI
 enum { D_SETTEXTURE = 65, D_DRAWPRIM = 81, D_DRAWINDEXED = 82, D_DRAWPRIMUP = 83, D_DRAWINDEXEDUP = 84 };
 
 static HRESULT WINAPI Dev_SetTexture(IDirect3DDevice9 *dev, DWORD stage, IDirect3DBaseTexture9 *t) {
+    ensure_lifecycle_hooks(dev);
     int slot = sampler_slot(stage);
     if (slot >= 0) g_bound[slot].store(t, std::memory_order_relaxed);
     if (t && g_dirty_count.load(std::memory_order_acquire) > 0 && dirty_bloom_maybe(t)) {
@@ -1288,6 +1332,7 @@ static HRESULT WINAPI Dev_SetTexture(IDirect3DDevice9 *dev, DWORD stage, IDirect
 // StretchRect can copy from a level of a rewritten texture: its changes go up first
 static HRESULT WINAPI Dev_StretchRect(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, const RECT *sr, IDirect3DSurface9 *dst,
                                       const RECT *dr, D3DTEXTUREFILTERTYPE filter) {
+    ensure_lifecycle_hooks(dev);
     if (src && g_dirty_count.load(std::memory_order_acquire) > 0 && s_surf_count.load(std::memory_order_relaxed) > 0) {
         CsGuard g;
         if (SurfRef *ref = g_surfs.find(src))
@@ -1296,24 +1341,25 @@ static HRESULT WINAPI Dev_StretchRect(IDirect3DDevice9 *dev, IDirect3DSurface9 *
     }
     return orig<StretchRect_t>(VT_DEV, dev, D_STRETCHRECT)(dev, src, sr, dst, dr, filter);
 }
-static __forceinline void before_draw() {
+static __forceinline void before_draw(IDirect3DDevice9 *dev) {
+    ensure_lifecycle_hooks(dev);
     if (g_bound_dirty_mask.load(std::memory_order_acquire) != 0) { CsGuard g; flush_bound(); }
 }
 static HRESULT WINAPI Dev_DrawPrimitive(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, UINT start, UINT count) {
-    before_draw();
+    before_draw(dev);
     return orig<DrawPrimitive_t>(VT_DEV, dev, D_DRAWPRIM)(dev, type, start, count);
 }
 static HRESULT WINAPI Dev_DrawIndexedPrimitive(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT base, UINT min, UINT num, UINT start, UINT count) {
-    before_draw();
+    before_draw(dev);
     return orig<DrawIndexedPrimitive_t>(VT_DEV, dev, D_DRAWINDEXED)(dev, type, base, min, num, start, count);
 }
 static HRESULT WINAPI Dev_DrawPrimitiveUP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, UINT count, const void *data, UINT stride) {
-    before_draw();
+    before_draw(dev);
     return orig<DrawPrimitiveUP_t>(VT_DEV, dev, D_DRAWPRIMUP)(dev, type, count, data, stride);
 }
 static HRESULT WINAPI Dev_DrawIndexedPrimitiveUP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, UINT min, UINT num, UINT count,
                                                  const void *idx, D3DFORMAT fmt, const void *data, UINT stride) {
-    before_draw();
+    before_draw(dev);
     return orig<DrawIndexedPrimitiveUP_t>(VT_DEV, dev, D_DRAWINDEXEDUP)(dev, type, min, num, count, idx, fmt, data, stride);
 }
 
@@ -1322,6 +1368,7 @@ typedef HRESULT(WINAPI *EndStateBlock_t)(IDirect3DDevice9 *, IDirect3DStateBlock
 enum { D_BEGINSTATEBLOCK = 60, D_ENDSTATEBLOCK = 61 };
 
 static HRESULT WINAPI Dev_BeginStateBlock(IDirect3DDevice9 *dev) {
+    ensure_lifecycle_hooks(dev);
     HRESULT hr = orig<BeginStateBlock_t>(VT_DEV, dev, D_BEGINSTATEBLOCK)(dev);
     // Native d3d9 swaps the device vtable during state-block recording; re-apply hooks on the new table.
     if (SUCCEEDED(hr) && s_device_ex.load(std::memory_order_relaxed)) hook_device(dev);
@@ -1329,6 +1376,7 @@ static HRESULT WINAPI Dev_BeginStateBlock(IDirect3DDevice9 *dev) {
 }
 
 static HRESULT WINAPI Dev_EndStateBlock(IDirect3DDevice9 *dev, IDirect3DStateBlock9 **sb) {
+    ensure_lifecycle_hooks(dev);
     HRESULT hr = orig<EndStateBlock_t>(VT_DEV, dev, D_ENDSTATEBLOCK)(dev, sb);
     // Native d3d9 restores the normal device vtable with unhooked pointers; re-apply hooks immediately.
     if (s_device_ex.load(std::memory_order_relaxed)) hook_device(dev);
@@ -1336,6 +1384,12 @@ static HRESULT WINAPI Dev_EndStateBlock(IDirect3DDevice9 *dev, IDirect3DStateBlo
 }
 
 static HRESULT WINAPI Dev_Reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) {
+    static __declspec(thread) bool t_in_reset = false;
+    if (t_in_reset) {
+        if (auto raw = (Reset_t)s_raw_reset.load(std::memory_order_acquire)) return raw(dev, pp);
+        return D3DERR_INVALIDCALL;
+    }
+    struct Guard { bool &f; Guard(bool &b) : f(b) { f = true; } ~Guard() { f = false; } } guard(t_in_reset);
     HRESULT hr = orig<Reset_t>(VT_DEV, dev, D_RESET)(dev, pp);
     bool used_ex = false;
     if (FAILED(hr) && s_device_ex.load(std::memory_order_acquire) && pp && !pp->Windowed) {
@@ -1409,27 +1463,51 @@ static ULONG WINAPI Dev_Release(IDirect3DDevice9 *dev) {
     return n;
 }
 
-static void hook_device(IDirect3DDevice9 *dev) {
-    hook(VT_DEV, dev, D_RELEASE, (void *)Dev_Release);
-    hook(VT_DEV, dev, D_CREATETEXTURE, (void *)Dev_CreateTexture);
-    hook(VT_DEV, dev, D_CREATECUBE, (void *)Dev_CreateCubeTexture);
-    hook(VT_DEV, dev, D_CREATEVOLUME, (void *)Dev_CreateVolumeTexture);
-    hook(VT_DEV, dev, D_CREATEVB, (void *)Dev_CreateVertexBuffer);
-    hook(VT_DEV, dev, D_CREATEIB, (void *)Dev_CreateIndexBuffer);
-    hook(VT_DEV, dev, D_PRESENT, (void *)Dev_Present);
-    hook(VT_DEV, dev, D_RESET, (void *)Dev_Reset);
-    hook(VT_DEV, dev, D_TESTCOOP, (void *)Dev_TestCooperativeLevel);
-    hook(VT_DEV, dev, D_BEGINSTATEBLOCK, (void *)Dev_BeginStateBlock);
-    hook(VT_DEV, dev, D_ENDSTATEBLOCK, (void *)Dev_EndStateBlock);
-    hook(VT_DEV, dev, D_SETTEXTURE, (void *)Dev_SetTexture);
-    hook(VT_DEV, dev, D_STRETCHRECT, (void *)Dev_StretchRect);
-    hook(VT_DEV, dev, D_DRAWPRIM, (void *)Dev_DrawPrimitive);
-    hook(VT_DEV, dev, D_DRAWINDEXED, (void *)Dev_DrawIndexedPrimitive);
-    hook(VT_DEV, dev, D_DRAWPRIMUP, (void *)Dev_DrawPrimitiveUP);
-    hook(VT_DEV, dev, D_DRAWINDEXEDUP, (void *)Dev_DrawIndexedPrimitiveUP);
+static void hook_device_core(IDirect3DDevice9 *dev, bool initial) {
+    hook(VT_DEV, dev, D_CREATETEXTURE, (void *)Dev_CreateTexture, initial);
+    hook(VT_DEV, dev, D_CREATECUBE, (void *)Dev_CreateCubeTexture, initial);
+    hook(VT_DEV, dev, D_CREATEVOLUME, (void *)Dev_CreateVolumeTexture, initial);
+    hook(VT_DEV, dev, D_CREATEVB, (void *)Dev_CreateVertexBuffer, initial);
+    hook(VT_DEV, dev, D_CREATEIB, (void *)Dev_CreateIndexBuffer, initial);
+    hook(VT_DEV, dev, D_TESTCOOP, (void *)Dev_TestCooperativeLevel, initial);
+    hook(VT_DEV, dev, D_BEGINSTATEBLOCK, (void *)Dev_BeginStateBlock, initial);
+    hook(VT_DEV, dev, D_ENDSTATEBLOCK, (void *)Dev_EndStateBlock, initial);
+    hook(VT_DEV, dev, D_SETTEXTURE, (void *)Dev_SetTexture, initial);
+    hook(VT_DEV, dev, D_STRETCHRECT, (void *)Dev_StretchRect, initial);
+    hook(VT_DEV, dev, D_DRAWPRIM, (void *)Dev_DrawPrimitive, initial);
+    hook(VT_DEV, dev, D_DRAWINDEXED, (void *)Dev_DrawIndexedPrimitive, initial);
+    hook(VT_DEV, dev, D_DRAWPRIMUP, (void *)Dev_DrawPrimitiveUP, initial);
+    hook(VT_DEV, dev, D_DRAWINDEXEDUP, (void *)Dev_DrawIndexedPrimitiveUP, initial);
     // Make sure the originals used internally exist even if never hooked through a call.
     save_orig(VT_DEV, dev, D_UPDATESURFACE);
     save_orig(VT_DEV, dev, D_UPDATETEXTURE);
+    if (initial) {
+        void **vt = *(void ***)dev;
+        if (vt[D_RESET] != (void *)Dev_Reset) s_raw_reset.store(vt[D_RESET], std::memory_order_release);
+        if (vt[D_PRESENT] != (void *)Dev_Present) s_raw_present.store(vt[D_PRESENT], std::memory_order_release);
+    }
+}
+
+// Release, Reset, and Present are hooked lazily (once per device) on the first call after CreateDevice
+// returns. Overlays that wrap IDirect3D9::CreateDevice (e.g. Steam's gameoverlayrenderer.dll) inspect
+// dev->vt[2/16/17] right after our D3D_CreateDevice returns and inline-hook whatever pointer sits
+// there; leaving d3d9's own pointers in those slots during CreateDevice prevents the overlay from
+// inline-hooking Dev_Release/Dev_Reset/Dev_Present into a mutual recursion cycle.
+static void __declspec(noinline) hook_device_lifecycle(IDirect3DDevice9 *dev) {
+    IDirect3DDevice9 *expected = dev;
+    if (!s_lifecycle_pending.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel)) return;
+    hook(VT_DEV, dev, D_RELEASE, (void *)Dev_Release, true);
+    hook(VT_DEV, dev, D_RESET, (void *)Dev_Reset, true);
+    hook(VT_DEV, dev, D_PRESENT, (void *)Dev_Present, true);
+}
+
+static void hook_device(IDirect3DDevice9 *dev) {
+    hook_device_core(dev, false);
+    if (s_lifecycle_pending.load(std::memory_order_acquire) != dev) {
+        hook(VT_DEV, dev, D_RELEASE, (void *)Dev_Release, false);
+        hook(VT_DEV, dev, D_RESET, (void *)Dev_Reset, false);
+        hook(VT_DEV, dev, D_PRESENT, (void *)Dev_Present, false);
+    }
 }
 
 // ---------------------------------------------------------------- Direct3DCreate9 export hook
@@ -1467,7 +1545,8 @@ static HRESULT WINAPI D3D_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE
             s_need_reset.store(false, std::memory_order_relaxed);
             { CsGuard g; g_active_dev = dev; g_staging_adds_dev_ref = -1; }
             *out = dev;
-            hook_device(dev);
+            s_lifecycle_pending.store(dev, std::memory_order_release);
+            hook_device_core(dev, true);
             log("device: Direct3D 9Ex on '%s', %ux%u %s (fmt %u, mode fmt %u), flags %08lx; offloading textures=%d buffers=%d",
                 id.Description, pp->BackBufferWidth, pp->BackBufferHeight, pp->Windowed ? "windowed" : "fullscreen",
                 (unsigned)pp->BackBufferFormat, (unsigned)mode.Format, flags, g_settings.offload_textures,
@@ -1485,6 +1564,7 @@ static HRESULT WINAPI D3D_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE
                 if (SUCCEEDED(fb)) {
                     s_adapter = adapter;
                     s_device_ex.store(false, std::memory_order_release);
+                    s_lifecycle_pending.store(nullptr, std::memory_order_release);
                     s_multithreaded.store((flags & D3DCREATE_MULTITHREADED) != 0, std::memory_order_release);
                     s_need_reset.store(false, std::memory_order_relaxed);
                     log("device: normal Direct3D 9 device via fallback (nothing offloaded)");
@@ -1505,9 +1585,11 @@ static HRESULT WINAPI D3D_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE
         s_need_reset.store(false, std::memory_order_relaxed);
         if (is_ex) {
             { CsGuard g; g_active_dev = *out; g_staging_adds_dev_ref = -1; }
-            hook_device(*out);
+            s_lifecycle_pending.store(*out, std::memory_order_release);
+            hook_device_core(*out, true);
             log("device: CreateDevice returned an IDirect3DDevice9Ex; hooks enabled");
         } else {
+            s_lifecycle_pending.store(nullptr, std::memory_order_release);
             log("device: normal Direct3D 9 device (nothing offloaded)");
         }
     }
@@ -1617,6 +1699,7 @@ void install_d3d9() {
     if (!g_settings.d3d9ex) { log("d3d9: switched off in the settings"); return; }
     HMODULE d3d9 = LoadLibraryW(L"d3d9.dll");
     if (!d3d9) { log("d3d9: d3d9.dll could not be loaded (%lu)", GetLastError()); return; }
+    g_d3d9_mod = d3d9;
     wchar_t path[MAX_PATH], sys[MAX_PATH], wow[MAX_PATH];
     if (!GetModuleFileNameW(d3d9, path, MAX_PATH)) path[0] = 0;
     // A 32-bit process on 64-bit Windows sees System32 in module paths (redirected to SysWOW64).

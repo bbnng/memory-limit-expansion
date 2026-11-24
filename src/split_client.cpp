@@ -105,7 +105,11 @@ static void ensure_cs() {
 }
 static std::atomic<uint32_t> s_pending_work{0}; // bit 0: console, 1: cmds, 2: saveclient, 3: preload
 static std::atomic<bool> s_server_dead{false};  // set by server_input_thread when active server exits
-static std::atomic<bool> s_load_failed{false};  // set when server reports map/load did not spawn a level
+// Level commands sent to the server are numbered ("memx:loadid"), so that a late report about an earlier
+// one ("memx:loadfailed <number>") can never end the loading screen of the one the player waits for.
+static long s_load_id;                          // the last level command's number (main thread)
+static bool s_load_expects_level;               // it put the loading screen up (map, load)
+static std::atomic<long> s_load_failed_id{0};   // the server says this command did not start a level
 static std::vector<std::string> s_to_console;   // server output for the game's console
 static std::vector<std::string> s_from_server;  // commands the server's code ran that exist only in this process
 static std::string s_save_client_req;           // .HL2 path the server asked this process to write
@@ -233,9 +237,8 @@ static void handle_server_line(const ServerConn *conn, const std::string &line, 
         if (line == "memx:alive") {
             s_alive_tick = GetTickCount();
             InterlockedExchange(&s_alive_seen, 1);
-        } else if (line == "memx:loadfailed") {
-            InterlockedExchange(&s_server_loading, 0);
-            s_load_failed.store(true, std::memory_order_release);
+        } else if (line.rfind("memx:loadfailed ", 0) == 0) {
+            s_load_failed_id.store(atol(line.c_str() + 16), std::memory_order_release);
             log("split: server: %s", line.c_str());
         } else if (line.rfind("memx:ready", 0) == 0) {
             InterlockedExchange(&s_server_loading, 0);
@@ -419,7 +422,7 @@ static bool start_server() {
     s_healthy_since = 0;
     InterlockedExchange(&s_alive_seen, 0);
     InterlockedExchange(&s_server_loading, 0);
-    s_load_failed.store(false, std::memory_order_release);
+    s_load_failed_id.store(0, std::memory_order_release);
     char pipe_arg[64];
     char pipe_name[128];
     if (gen == 1) snprintf(pipe_arg, sizeof(pipe_arg), "%lu", GetCurrentProcessId());
@@ -837,6 +840,13 @@ static void close_dialog_window() {
     ((int(__cdecl *)(const char *, int, void *))fn)("DialogCtrl", sizeof(msg), msg);
 }
 
+// a level command for the server; "expects_level": the loading screen is up and waits for the level
+static void level_command_to_server(const std::string &line, bool expects_level) {
+    s_load_expects_level = expects_level || (s_load_expects_level && s_want_game && *(volatile int *)kClsState < 4);
+    to_server("memx:loadid " + std::to_string(++s_load_id));
+    to_server(line);
+}
+
 static void start_on_server(const char *verb) {
     if (*(int *)kCmdSource != 1 || Cmd_Argc() < 2 || !ensure_server()) return call_original(verb);
     char map[128] = {};
@@ -876,7 +886,7 @@ static void start_on_server(const char *verb) {
         log("split: left the level here before the server loads");
     }
     send_game_state();
-    to_server(line);
+    level_command_to_server(line, starts);
 }
 static void split_map() { start_on_server("map"); }
 static void split_load() { start_on_server("load"); }
@@ -892,7 +902,7 @@ static void forward_in_game(const char *verb) {
     std::string line = verb;
     if (Cmd_Argc() > 1) line += " " + args_from(1);
     log("split: %s", line.c_str());
-    to_server(line);
+    level_command_to_server(line, false);
 }
 static void split_changelevel() { forward_in_game("changelevel"); }
 static void split_reload() { forward_in_game("reload"); }
@@ -1275,25 +1285,29 @@ static void __cdecl client_frame() {
                 Cbuf_AddText((c + "\n").c_str());
             }
         }
+        long failed_id = s_load_failed_id.exchange(0, std::memory_order_acq_rel);
         // Periodic watchdog & settings sync (avoids WaitForSingleObject syscalls every frame).
         if (s_want_game) {
             DWORD now = GetTickCount();
             static DWORD last_watch;
             bool dead = s_server_dead.load(std::memory_order_acquire);
-            bool load_failed = s_load_failed.exchange(false, std::memory_order_acq_rel);
-            if (!dead && load_failed) {
-                log("split: server reported map/load failure; dismissing loading screen");
+            if (!dead && failed_id != 0 && failed_id == s_load_id) {
+                InterlockedExchange(&s_server_loading, 0);
                 Con_Printf("Memory Expansion: the server could not load that map or save.\n");
-                s_ready_for_connect = false;
-                s_preloaded_map.clear();
-                EnterCriticalSection(&s_cs);
-                s_preload_req.clear();
-                s_from_server.clear();
-                s_pending_work.fetch_and(~10u, std::memory_order_release);
-                LeaveCriticalSection(&s_cs);
-                if (*(volatile int *)kClsState < 4) {
+                if (s_load_expects_level && *(volatile int *)kClsState < 4) {
+                    log("split: the server could not start the level; back to the menu");
                     s_want_game = false;
-                    Cbuf_AddText("disconnect\ntoggleconsole\n");
+                    s_ready_for_connect = false;
+                    s_preloaded_map.clear();
+                    EnterCriticalSection(&s_cs);
+                    s_preload_req.clear();
+                    s_from_server.clear();
+                    s_pending_work.fetch_and(~10u, std::memory_order_release);
+                    LeaveCriticalSection(&s_cs);
+                    // "disconnect" takes the loading screen down and shows the menu. The console stays as it
+                    // is, as when a load fails in single player ("toggleconsole" opened it over the menu, or
+                    // closed it on the player who typed the command there).
+                    Cbuf_AddText("disconnect\n");
                 }
             }
             if (!dead && s_want_game && now - last_watch >= 250) {
