@@ -52,7 +52,7 @@ Setting `[Engine] hunk_mb` (200–1024 MB) raises that cap by byte-checking and 
 immediates in `engine.dll` as it loads (and again if the engine restarts). Off by default (`0`),
 since stock maps use well under 200 MB. `-heapsize` on the command line still takes precedence.
 
-### 3. Client/Server process split (experimental, `[Split] enabled = 1`)
+### 3. Client/Server process split (experimental, on by default: `[Split] enabled = 1`)
 
 Bloodlines is built on the Source engine, which separates the game into two halves communicating over
 a network channel: the **server** (`vampire.dll`: characters, AI, physics, Python scripts, saves) and
@@ -114,7 +114,7 @@ Copy the release files into your game folder:
 
 - `Bin/loader/memory_expansion.vtm`
 - `Bin/loader/memory_expansion.ini`
-- `Bin/shaderapiempty.dll` (only needed if you enable `[Split] enabled = 1`)
+- `Bin/shaderapiempty.dll` (used by `[Split] enabled = 1`, on by default)
 
 The Unofficial Patch loader loads `.vtm` plugins from `Bin/loader/` automatically at startup. Edit
 `Bin/loader/memory_expansion.ini` to configure options.
