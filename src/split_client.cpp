@@ -8,6 +8,7 @@
 // arrives. Level changes happen on the server; when the server reports a new level the game reconnects if
 // it is not already on its way. If the server process cannot be started, the commands run locally as before.
 #include "common.h"
+#include "split_player_interp.h"
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -1252,6 +1253,12 @@ static float __fastcall split_npc_interp_fraction(BYTE *ent) {
     return f;
 }
 
+// C_BasePlayer::Interpolate (client.dll+0xA6B10), in place of its IsLocalPlayer() call: interpolate the local
+// player too, but only once it has the two position samples that takes (split_player_interp.h).
+static int __fastcall split_skip_player_interp(const BYTE *player) {
+    return player_interp_ready(player) ? 0 : 1;
+}
+
 // True once client.dll has created the local player (C_BasePlayer::s_pLocalPlayer at client.dll+0x4A0D50,
 // verified against FUN_10173350+0x35: mov eax,[s_pLocalPlayer]; test eax,eax; jz +0x14).
 // Server-forwarded client commands (e.g. "createplayer" on sp_genesisdevice_1 tick 1) arrive over the pipe
@@ -1479,20 +1486,30 @@ static void __cdecl client_frame() {
     // Enable zero-desync local-player interpolation in split mode (once per loaded client.dll).
     // Vanilla VTMB runs cl_predict 0 because client.dll's CGameMovement lacks Troika's VTMB extensions
     // (causing +/-0.15..0.43 unit per-tick prediction errors and visible A/D strafing jitter with cl_predict 1).
-    // NOPing the IsLocalPlayer() early-out in C_BasePlayer::Interpolate (client+0xA6B1D: 75 5B -> 90 90)
-    // with cl_interp 0.025 smoothly interpolates authoritative 144 Hz server snapshots at full render FPS
+    // Replacing the IsLocalPlayer() early-out in C_BasePlayer::Interpolate (call at client+0xA6B16) with
+    // cl_interp 0.025 smoothly interpolates authoritative 144 Hz server snapshots at full render FPS
     // with zero prediction snaps and zero cl_predictweapons side effects (mouse look stays 0 ms direct).
+    // The early-out must stay for a player without position samples (just created: a level's first frames,
+    // any full update). Versions up to 1.1.1 removed it altogether: the player was then put at whatever was
+    // on the stack, weapons that follow it took that over, and two of them at NaN positions filled the
+    // client's spatial partition ("CUtlLinkedList overflow!" at the end of a level change).
     if (s_server && !*(volatile int *)kSvActive) {
         HMODULE cl = GetModuleHandleW(L"client.dll");
         if (cl && cl != s_interp_client) {
             s_interp_client = cl;
-            static const CodePatch kLocalInterp = {
+            // call IsLocalPlayer; test al, al; jnz +5Bh: the call alone is redirected
+            CodePatch local_interp = {
                 0xA6B16,
                 {0xE8, 0xB5, 0x2E, 0x00, 0x00, 0x84, 0xC0, 0x75, 0x5B},
-                {0xE8, 0xB5, 0x2E, 0x00, 0x00, 0x84, 0xC0, 0x90, 0x90},
+                {0xE8, 0, 0, 0, 0, 0x84, 0xC0, 0x75, 0x5B},
                 9,
                 "split: smooth local-player interpolation"};
-            apply_patch(cl, kLocalInterp);
+            DWORD local_rel = (DWORD)((uintptr_t)&split_skip_player_interp - ((uintptr_t)cl + 0xA6B16 + 5));
+            memcpy(local_interp.repl + 1, &local_rel, 4);
+            if (in_module_image(cl, 0xA6970, 0x200) && in_module_image(cl, 0xA1EF0, 0x100) &&
+                player_history_code_ok_at((const unsigned char *)cl))
+                apply_patch(cl, local_interp);
+            else log("not patched (unknown bytes): split: smooth local-player interpolation");
             // C_BaseAnimating::Interpolate (MOVETYPE_STEP NPCs): replace call [edx+0x1E8] at client+0x94F62
             // (6 bytes: FF 92 E8 01 00 00) with call split_npc_interp_fraction; nop.
             CodePatch npc_interp = {
