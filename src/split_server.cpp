@@ -1056,6 +1056,56 @@ static bool client_signing_on(int *seq_out) {
     return signing;
 }
 
+// ---- defer player usercmds until the client has completed its first full entity snapshot ----
+// SV_ProcessUsercmds (engine.dll+0xF9990) executes CBasePlayer::ProcessUsercmds -> PostThink as soon as
+// host_client->active || host_client->spawned. Over UDP, the client sends clc_move during signon2 (when
+// client->spawned == 1, client->active == 0) before the first svc_packetentities snapshot creates client
+// entities. On save loads and level transitions, CBasePlayer::OnRestore sets a 10-PostThink countdown to
+// resend CItemGKeyring's keys via reliable svc_entitymessage ('z'); if those 10 usercmds run before the
+// client finishes its initial full update (including any retry forced at engine+0xF2C19..F2C4B when the
+// first parse takes > 1 server frame), CL_Parse_EntityMessage drops every key (GetClientNetworkable == NULL)
+// or the retry full update destroys/recreates C_ItemGKeyring empty, crashing client.dll+0x38b9 on the next
+// key removal + pickup. Keep ignore=1 in SV_ProcessUsercmds until the client is active AND its initial full
+// update is acknowledged in the exact way SV_ReadPackets checks it, with a 5 s safety fallback.
+static int s_snapshot_acked_spawn = -1;
+static int s_active_seen_spawn = -1;
+static DWORD s_active_seen_tick = 0;
+
+static void *__cdecl split_clc_delta(void *cl) {
+    void *r = ((void *(__cdecl *)(void *))0x200F9900)(cl);
+    if (cl && *(volatile int *)((BYTE *)cl + 12)) {
+        int delta = *(volatile int *)((BYTE *)cl + 0x1FE04);
+        int ack = *(volatile int *)((BYTE *)cl + 0x54);
+        int pending = *(volatile int *)((BYTE *)cl + 0x1FE10);
+        BYTE resend = *(volatile BYTE *)((BYTE *)cl + 0x1FE14);
+        if (delta > 0 && ((pending == -1 && !resend) || (ack == pending && delta == (pending & 0xFFF)))) {
+            s_snapshot_acked_spawn = *(volatile int *)0x212AF1D0;
+        }
+    }
+    return r;
+}
+
+static int __cdecl split_usercmds_ready() {
+    BYTE *cl = *(BYTE *volatile *)0x20B42B74;   // host_client
+    if (!cl || !*(volatile int *)(cl + 12)) {   // !client->active
+        s_snapshot_acked_spawn = -1;
+        s_active_seen_spawn = -1;
+        return 0;
+    }
+    int spawn = *(volatile int *)0x212AF1D0;    // svs.spawncount
+    if (s_snapshot_acked_spawn == spawn) return 1;
+    DWORD now = GetTickCount();
+    if (s_active_seen_spawn != spawn) {
+        s_active_seen_spawn = spawn;
+        s_active_seen_tick = now ? now : 1;
+    } else if (now - s_active_seen_tick >= 5000) {
+        log("server: clc_delta timeout after 5 s (spawn %d); allowing usercmds", spawn);
+        s_snapshot_acked_spawn = spawn;
+        return 1;
+    }
+    return 0;
+}
+
 // ---- reliable dialogue voice and string-table ordering ----
 // Two engine.dll 1.2 bugs hit dialogue voices and sounds over 127.0.0.1 UDP:
 // 1. SV_SendClientDatagrams (0x200F3F25) skips SV_WriteClientdataToMessage (and thus SV_UpdateStringTables)
@@ -1377,6 +1427,37 @@ void on_engine_mapped(HMODULE engine) {
         memcmp((BYTE *)engine + 0x4CC0, kBfStartWritingBytes, sizeof(kBfStartWritingBytes)) == 0) {
         redirect_call(engine, 0xF3FA3, 0x5190, (void *)split_append_datagram, "server: string tables before datagram sounds");
         redirect_call(engine, 0x19E1, 0xEF730, (void *)split_start_sound, "server: reliable dialogue voice");
+    }
+    // Defer SV_ProcessUsercmds (engine+0xF9AA0) until the client is active and has completed its initial
+    // full entity update via clc_delta (slot 0x201AC874), so post-restore PostThink entity messages
+    // (e.g. CItemGKeyring::ResendKeysToClient) do not fire before client.dll finishes its first snapshot.
+    {
+        static const BYTE kUsercmdTail[] = {0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x07};
+        CodePatch usercmd_gate = {
+            0xF9AA0,
+            {0xA1, 0x74, 0x2B, 0xB4, 0x20, 0x8B, 0x48, 0x0C, 0x85, 0xC9, 0x75, 0x07},
+            {0xE8, 0, 0, 0, 0, 0x85, 0xC0, 0x74, 0x11, 0xEB, 0x08, 0x90},
+            12,
+            "server: wait for first client snapshot before usercmds"};
+        DWORD rel = (DWORD)((uintptr_t)&split_usercmds_ready - ((uintptr_t)engine + usercmd_gate.rva + 5));
+        memcpy(usercmd_gate.repl + 1, &rel, 4);
+        void **clc_delta_slot = (void **)0x201AC874;
+        if (in_module_image(engine, 0xF9AA0, 19) &&
+            in_module_image(engine, 0x1AC874, 4) &&
+            memcmp((BYTE *)engine + 0xF9AAC, kUsercmdTail, sizeof(kUsercmdTail)) == 0 &&
+            patch_matches(engine, usercmd_gate) &&
+            (*clc_delta_slot == (void *)0x200F9900 || *clc_delta_slot == (void *)split_clc_delta)) {
+            s_snapshot_acked_spawn = -1;
+            s_active_seen_spawn = -1;
+            patch_vtable(clc_delta_slot, 0, (void *)split_clc_delta);
+            if (*clc_delta_slot == (void *)split_clc_delta) {
+                apply_patch(engine, usercmd_gate);
+            } else {
+                log("not patched (could not hook clc_delta): %s", usercmd_gate.what);
+            }
+        } else {
+            log("not patched (unknown bytes): %s", usercmd_gate.what);
+        }
     }
     // Sys_Printf: call _printf (engine+0x164458) -> server_print
     redirect_call(engine, 0xFA3E3, 0x164458, (void *)server_print, "Sys_Printf output");

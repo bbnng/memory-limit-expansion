@@ -129,6 +129,48 @@ static HMODULE s_interp_client;                 // client.dll already patched fo
 static HMODULE s_checked_cl;                    // client.dll already checked for s_pLocalPlayer offset
 static bool s_offset_ok;
 
+// Guard C_ItemGKeyring::ReceiveMessage (client.dll+0x37F0, vtable slot +0x1E4488) against underflow
+// and duplicate adds: vanilla client.dll unconditionally decrements m_Size (+0x97C) on '{' (remove key)
+// even when m_Size == 0 or idx >= m_Size; if m_Size becomes -1 while m_pMemory == NULL, the next 'z'
+// (add key) skips allocation (-1 + 1 <= 0) and writes 192 bytes to 0xFFFFFF40 (client.dll+0x38B9 crash).
+typedef int(__fastcall *KeyringRecv_t)(void *self, void *, int size, void *data);
+static KeyringRecv_t s_keyring_recv_orig;
+static int __fastcall split_keyring_receive_message(void *self, void *, int size, void *data) {
+    if (self && data && size >= 1) {
+        const BYTE *buf = (const BYTE *)data;
+        int &count = *(int *)((BYTE *)self + 0x97C);
+        if (buf[0] == '{') {
+            int idx = (size >= 2) ? (int)buf[1] : 0;
+            if (count <= 0 || idx >= count) {
+                log("split: ignored out-of-range keyring removal (idx=%d, client count=%d)", idx, count);
+                return 0;
+            }
+        } else if (buf[0] == 'z') {
+            if (count < 0) {
+                log("split: clamped negative keyring count (%d -> 0) before add", count);
+                count = 0;
+            }
+            const char *mem = *(const char *const *)((const BYTE *)self + 0x970);
+            int alloc = *(const int *)((const BYTE *)self + 0x974);
+            int n = (count < alloc) ? count : alloc;
+            if (mem && n > 0 && size >= 2) {
+                char key[96];
+                size_t avail = (size_t)(size - 1);
+                size_t klen = 0;
+                while (klen < avail && klen < sizeof(key) - 1 && buf[1 + klen] != '\0') {
+                    key[klen] = (char)buf[1 + klen];
+                    ++klen;
+                }
+                key[klen] = '\0';
+                for (int i = 0; i < n; ++i) {
+                    if (_strnicmp(mem + (size_t)i * 192, key, 96) == 0) return 0;
+                }
+            }
+        }
+    }
+    return s_keyring_recv_orig ? s_keyring_recv_orig(self, nullptr, size, data) : 0;
+}
+
 // The server's main loop sends "memx:alive" once a second (split_server.cpp). A server process that still
 // runs but stops sending it is stuck: the world stands still and the game would show "Connection
 // Problem" or its loading screen for good. It is ended, and the game goes back to the menu (client_frame).
@@ -1462,6 +1504,23 @@ static void __cdecl client_frame() {
             DWORD rel = (DWORD)((uintptr_t)&split_npc_interp_fraction - ((uintptr_t)cl + 0x94F62 + 5));
             memcpy(npc_interp.repl + 1, &rel, 4);
             apply_patch(cl, npc_interp);
+            // C_ItemGKeyring::ReceiveMessage bounds guard (vtable slot client+0x1E4488 -> client+0x37F0).
+            static const BYTE kKeyringHead[] = {0x8B, 0x44, 0x24, 0x04, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00, 0x56, 0x8B, 0xF1, 0x8B, 0x8C, 0x24};
+            static const BYTE kKeyringRem[] = {0x3C, 0x7B, 0x75, 0x40, 0xE8, 0xC1, 0x0D, 0x11, 0x00, 0x8B, 0x8E, 0x7C, 0x09, 0x00, 0x00, 0x2B};
+            void *expected_fn = (void *)((BYTE *)cl + 0x37F0);
+            void **slot = (void **)((BYTE *)cl + 0x1E4488);
+            if (in_module_image(cl, 0x37F0, sizeof(kKeyringHead)) &&
+                in_module_image(cl, 0x38C6, sizeof(kKeyringRem)) &&
+                in_module_image(cl, 0x1E4488, sizeof(void *)) &&
+                memcmp((BYTE *)cl + 0x37F0, kKeyringHead, sizeof(kKeyringHead)) == 0 &&
+                memcmp((BYTE *)cl + 0x38C6, kKeyringRem, sizeof(kKeyringRem)) == 0 &&
+                (*slot == expected_fn || *slot == (void *)split_keyring_receive_message)) {
+                s_keyring_recv_orig = (KeyringRecv_t)expected_fn;
+                patch_vtable(slot, 0, (void *)split_keyring_receive_message);
+                if (g_settings.verbose) log("split: keyring ReceiveMessage guard active");
+            } else {
+                log("not patched (unknown bytes): split: keyring ReceiveMessage guard");
+            }
         }
     }
     Cbuf_Execute();

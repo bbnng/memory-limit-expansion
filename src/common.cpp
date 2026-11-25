@@ -137,7 +137,7 @@ static void startup(HMODULE self) {
     log_open();
     load_settings();
     VaStats va = va_stats();
-    log("Memory Expansion 1.1 loaded; address space: %llu MB used, %llu MB free (largest block %llu MB)",
+    log("Memory Expansion 1.1.1 loaded; address space: %llu MB used, %llu MB free (largest block %llu MB)",
         va.used >> 20, va.free_total >> 20, va.largest_free >> 20);
     log("already loaded: engine.dll %p, shaderapidx9.dll %p, tier0.dll %p, launcher.dll %p", GetModuleHandleW(L"engine.dll"),
         GetModuleHandleW(L"shaderapidx9.dll"), GetModuleHandleW(L"tier0.dll"), GetModuleHandleW(L"launcher.dll"));
