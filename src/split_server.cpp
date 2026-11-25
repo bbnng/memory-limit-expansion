@@ -295,6 +295,36 @@ static __declspec(naked) void cl_ret16() { __asm { xor eax, eax } __asm { ret 16
 static __declspec(naked) void cl_ret24() { __asm { xor eax, eax } __asm { ret 24 } }
 static const BYTE kClientArgBytes[45] = {12, 0, 4, 0, 0, 0, 0, 8, 4, 4, 0, 16, 4, 0, 0, 8, 0, 0, 4, 12, 24, 16, 4,
                                          8, 0, 4, 4, 8, 4, 0, 8, 4, 4, 4, 24, 24, 4, 4, 4, 4, 8, 4, 4, 12, 0};
+// VClient008 slot 43 (+0xAC, 12 arg bytes): CHLClient::SendInfoBarMessage(unsigned int type, int param, const char *str).
+// engine.dll calls it directly in Host_Savegame_f (79 "Game Saving...", 54 "Game Saved"),
+// Host_Autosave_f (79, 54), and CSaveRestore::ValidSave (55, 66..71 "Cannot save...").
+// Forward it to the game process so save/autosave/can't-save HUD notices appear as in single player.
+static void __fastcall null_client_infobar(void *, void *, unsigned int type, int param, const char *str) {
+    if (!s_stdout || type > 82) return;
+    char line[320];
+    if (str) {
+        char clean[200];
+        size_t n = 0;
+        __try {
+            for (const char *p = str; *p && n < sizeof(clean) - 1; ++p) {
+                unsigned char ch = (unsigned char)*p;
+                if (ch == '\r' || ch == '\n') continue;
+                clean[n++] = (char)ch;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            n = 0;
+        }
+        clean[n] = '\0';
+        if (n > 0) {
+            snprintf(line, sizeof(line), "memx:infobar %u %d %s\n", type, param, clean);
+            status_write(line);
+            return;
+        }
+    }
+    snprintf(line, sizeof(line), "memx:infobar %u %d\n", type, param);
+    status_write(line);
+}
+
 static void *s_null_client_vt[45];
 static void *s_null_client = s_null_client_vt;
 static void install_null_client() {
@@ -310,7 +340,31 @@ static void install_null_client() {
         default: s_null_client_vt[i] = (void *)cl_ret24; break;
         }
     }
+    s_null_client_vt[43] = (void *)null_client_infobar;
     *slot = &s_null_client;
+}
+
+// Pause refcounts (v_pause_count 0x20B43788, setpause_count 0x20B4378C) and v_paused_flag (0x20D63510)
+// are never cleared by SV_SpawnServer. Loading a save from the ESC menu or a paused UI screen disconnects
+// the client before unpause/v_unpause is forwarded, leaking the server pause refcount across levels.
+static bool s_pause_addrs_ok = false;
+static void check_server_pause_addrs(HMODULE engine) {
+    static const BYTE kVPauseCount[] = {0xA1, 0x88, 0x37, 0xB4, 0x20};
+    static const BYTE kVPauseFlag[] = {0xC7, 0x05, 0x10, 0x35, 0xD6, 0x20, 0x01, 0x00, 0x00, 0x00};
+    static const BYTE kSetPauseCount[] = {0xA1, 0x8C, 0x37, 0xB4, 0x20};
+    s_pause_addrs_ok = in_module_image(engine, 0x918A9, sizeof(kVPauseCount)) &&
+                       in_module_image(engine, 0x918BB, sizeof(kVPauseFlag)) &&
+                       in_module_image(engine, 0x9199B, sizeof(kSetPauseCount)) &&
+                       memcmp((const BYTE *)engine + 0x918A9, kVPauseCount, sizeof(kVPauseCount)) == 0 &&
+                       memcmp((const BYTE *)engine + 0x918BB, kVPauseFlag, sizeof(kVPauseFlag)) == 0 &&
+                       memcmp((const BYTE *)engine + 0x9199B, kSetPauseCount, sizeof(kSetPauseCount)) == 0;
+}
+static void reset_server_pause_state() {
+    if (!s_pause_addrs_ok) return;
+    *(volatile int *)0x20B43788 = 0;   // v_pause_count
+    *(volatile int *)0x20B4378C = 0;   // setpause_count
+    *(volatile int *)0x20D63510 = 0;   // v_paused_flag
+    *(volatile int *)0x212B0758 = 0;   // sv.paused
 }
 
 // ---- what the engine still has to do for a level command (split_load_watch.h) ----
@@ -1201,6 +1255,7 @@ static int __cdecl split_start_sound(IRecipientFilter *filter, void *edict, int 
 // seconds before sound_precache/ServerActivate finish: tell the game which BSP is loading so it can
 // preload maps/<name>.bsp in parallel while the server loads the world.
 static int __cdecl server_spawn_notify(int maxclients) {
+    reset_server_pause_state();
     const char *name = (const char *)0x212B0768;
     size_t len = strnlen(name, 64);
     if (s_stdout && len > 0 && len < 64 && !strchr(name, ' ') && !strchr(name, '\n') && !strchr(name, '\r')) {
@@ -1465,6 +1520,7 @@ void on_engine_mapped(HMODULE engine) {
     redirect_call(engine, 0xFA31A, 0x164458, (void *)server_fatal_print, "Sys_Error message");
 
     check_load_watch(engine);
+    check_server_pause_addrs(engine);
     init_changelevel_guard(engine);
     install_message_box_guard();
     static bool veh;

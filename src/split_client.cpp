@@ -104,7 +104,7 @@ static void ensure_cs() {
         InitOnceComplete(&s_cs_once, 0, nullptr);
     }
 }
-static std::atomic<uint32_t> s_pending_work{0}; // bit 0: console, 1: cmds, 2: saveclient, 3: preload
+static std::atomic<uint32_t> s_pending_work{0}; // bit 0: console, 1: cmds, 2: saveclient, 3: preload, 4: infobar
 static std::atomic<bool> s_server_dead{false};  // set by server_input_thread when active server exits
 // Level commands sent to the server are numbered ("memx:loadid"), so that a late report about an earlier
 // one ("memx:loadfailed <number>") can never end the loading screen of the one the player waits for.
@@ -113,6 +113,13 @@ static bool s_load_expects_level;               // it put the loading screen up 
 static std::atomic<long> s_load_failed_id{0};   // the server says this command did not start a level
 static std::vector<std::string> s_to_console;   // server output for the game's console
 static std::vector<std::string> s_from_server;  // commands the server's code ran that exist only in this process
+struct InfoBarMsg {
+    unsigned int type;
+    int param;
+    bool has_str;
+    std::string str;
+};
+static std::vector<InfoBarMsg> s_infobar_msgs;  // HUD InfoBar notices sent by server-side engine.dll (save/autosave/etc.)
 static std::string s_save_client_req;           // .HL2 path the server asked this process to write
 static long s_save_client_id;                   // sequence ID for s_save_client_req
 static std::string s_preload_req;               // maps/<name>.bsp the server just started loading
@@ -123,6 +130,7 @@ static BYTE *s_sent_cmd_head;                   // head of kCommandList at last 
 static std::unordered_set<std::string> s_sent_cmd_set; // command names already sent to this server
 static bool s_ready_for_connect;                // memx:ready arrived; uncap connect frames until cls_state != 2
 static bool s_preload_ok;                       // split_free_world hook verified and installed
+static bool s_pause_addrs_ok;                   // engine.dll cl.paused / v_pause_count / setpause_count / v_paused_flag verified
 static volatile bool s_split_fallback;          // permanent fallback to single player after restart limit
 static int s_restarts;                          // server restarts since last long healthy period
 static DWORD s_healthy_since;                   // GetTickCount() when current healthy server play began
@@ -326,6 +334,26 @@ static void handle_server_line(const ServerConn *conn, const std::string &line, 
                 log("split: warning: client command queue full (500), dropped: %.80s", cmd.c_str());
             }
             LeaveCriticalSection(&s_cs);
+        } else if (line.rfind("memx:infobar ", 0) == 0) {
+            const char *p = line.c_str() + 13;
+            char *end1 = nullptr, *end2 = nullptr;
+            unsigned long type = strtoul(p, &end1, 10);
+            if (end1 && end1 > p && *end1 == ' ' && type <= 82) {
+                long param = strtol(end1 + 1, &end2, 10);
+                if (end2 && end2 > end1 + 1 && (*end2 == '\0' || *end2 == ' ')) {
+                    InfoBarMsg msg = {(unsigned int)type, (int)param, false, {}};
+                    if (*end2 == ' ' && end2[1] != '\0') {
+                        msg.has_str = true;
+                        msg.str.assign(end2 + 1, strnlen(end2 + 1, 200));
+                    }
+                    EnterCriticalSection(&s_cs);
+                    if (s_infobar_msgs.size() < 64) {
+                        s_infobar_msgs.push_back(std::move(msg));
+                        s_pending_work.fetch_or(16u, std::memory_order_release);
+                    }
+                    LeaveCriticalSection(&s_cs);
+                }
+            }
         }
         return;
     }
@@ -677,6 +705,8 @@ static bool ensure_server() {
     s_conn = nullptr;
     s_preload_req.clear();
     s_save_client_req.clear();
+    s_infobar_msgs.clear();
+    s_pending_work.fetch_and(~28u, std::memory_order_release);
     LeaveCriticalSection(&s_cs);
     conn_release(old_conn);
     if (!start_server()) {
@@ -883,6 +913,44 @@ static void close_dialog_window() {
     ((int(__cdecl *)(const char *, int, void *))fn)("DialogCtrl", sizeof(msg), msg);
 }
 
+// Forwarded from the server's VClient008 slot 43 (Host_Savegame_f, Host_Autosave_f, CSaveRestore::ValidSave):
+// deliver the HUD InfoBar notice ("Game Saving...", green "Game Saved", "Cannot save...") through client.dll's
+// own CHLClient::SendInfoBarMessage (vtable slot 43, client.dll+0xCCA70).
+static void show_infobar_msg(const InfoBarMsg &m) {
+    HMODULE client = GetModuleHandleW(L"client.dll");
+    void *cl_dll = *(void *volatile *)0x201CC820;
+    if (!client || !cl_dll) return;
+    static const BYTE kInfoBarHead[] = {0xE8, 0x7B, 0x97, 0xF8, 0xFF, 0x85, 0xC0, 0x74, 0x1B,
+                                        0x8B, 0x44, 0x24, 0x0C, 0x8B, 0x4C, 0x24, 0x08};
+    void *fn = nullptr;
+    __try {
+        void **vt = *(void ***)cl_dll;
+        if (!vt) return;
+        fn = vt[43];
+        if (!fn) return;
+        uintptr_t base = (uintptr_t)client;
+        uintptr_t addr = (uintptr_t)fn;
+        if (addr < base || !in_module_image(client, (DWORD)(addr - base), sizeof(kInfoBarHead))) return;
+        if (memcmp(fn, kInfoBarHead, sizeof(kInfoBarHead)) != 0) return;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+    ((void(__fastcall *)(void *, void *, unsigned int, int, const char *))fn)(
+        cl_dll, nullptr, m.type, m.param, m.has_str ? m.str.c_str() : nullptr);
+}
+
+// CL_ClearState's memset begins at 0x203148A8, leaving cl.paused (0x20314874), v_pause_count (0x20B43788),
+// setpause_count (0x20B4378C), and v_paused_flag (0x20D63510) dirty when a save is loaded from a paused UI
+// screen or ESC menu. A stuck cl.paused=1 freezes client simulation/UI, and v_paused_flag=1 blocks every
+// gameplay keybinding in Key_Event while leaving the console openable.
+static void reset_client_pause_state() {
+    if (!s_pause_addrs_ok || *(volatile int *)kSvActive) return;
+    *(volatile int *)0x20314874 = 0;   // cl.paused
+    *(volatile int *)0x20B43788 = 0;   // v_pause_count
+    *(volatile int *)0x20B4378C = 0;   // setpause_count
+    *(volatile int *)0x20D63510 = 0;   // v_paused_flag
+}
+
 // a level command for the server; "expects_level": the loading screen is up and waits for the level
 static void level_command_to_server(const std::string &line, bool expects_level) {
     s_load_expects_level = expects_level || (s_load_expects_level && s_want_game && *(volatile int *)kClsState < 4);
@@ -912,7 +980,8 @@ static void start_on_server(const char *verb) {
         EnterCriticalSection(&s_cs);
         s_preload_req.clear();
         s_from_server.clear();
-        s_pending_work.fetch_and(~10u, std::memory_order_release);
+        s_infobar_msgs.clear();
+        s_pending_work.fetch_and(~26u, std::memory_order_release);
         LeaveCriticalSection(&s_cs);
         // the engine has no time limit on the loading screen: only for a level or save that exists (a missing
         // one never connects). Connect once "memx:ready" arrives so the client does not stall on cl_resend
@@ -958,22 +1027,32 @@ static void split_disconnect() {
     EnterCriticalSection(&s_cs);
     s_preload_req.clear();
     s_from_server.clear();
-    s_pending_work.fetch_and(~10u, std::memory_order_release);
+    s_infobar_msgs.clear();
+    s_pending_work.fetch_and(~26u, std::memory_order_release);
     LeaveCriticalSection(&s_cs);
     call_original("disconnect");
 }
 // v_setpause / v_unpause (client.dll's interface screens) pause the sound here and the world of this
 // process; the world is the server's: it pauses too (its "setpause" and "unpause", which the menu uses,
-// the engine forwards by itself as commands from the player)
-static void split_v_pause(const char *verb) {
-    call_original(verb);
-    if (s_want_game && server_usable() && *(volatile int *)kClsState >= 3) {
-        log("split: %s", verb);
-        to_server(verb);
+// the engine forwards by itself as commands from the player). Only forward v_setpause when it actually
+// incremented the client's pause counter while in-game, so signon-time calls never leak server v_pause_count.
+static void split_v_setpause() {
+    int before = s_pause_addrs_ok ? *(volatile int *)0x20B43788 : -1;
+    call_original("v_setpause");
+    bool client_paused = !s_pause_addrs_ok || (*(volatile int *)0x20B43788 != before);
+    int min_state = s_pause_addrs_ok ? 4 : 3;
+    if (client_paused && s_want_game && server_usable() && *(volatile int *)kClsState >= min_state) {
+        log("split: v_setpause");
+        to_server("v_setpause");
     }
 }
-static void split_v_setpause() { split_v_pause("v_setpause"); }
-static void split_v_unpause() { split_v_pause("v_unpause"); }
+static void split_v_unpause() {
+    call_original("v_unpause");
+    if (s_want_game && server_usable() && *(volatile int *)kClsState >= 3) {
+        log("split: v_unpause");
+        to_server("v_unpause");
+    }
+}
 
 // Console text that is no command goes to the game's Python (Cmd_ExecuteString -> 0x200DAB20). In single
 // player that Python is the one running the world; in a split game it is the server's.
@@ -1005,6 +1084,7 @@ static void reset_npc_interp();
 static const uintptr_t kStaticProps = 0x2129EDC0;
 static void __cdecl split_clear_state() {
     reset_npc_interp();
+    reset_client_pause_state();
     void **vt = *(void ***)kStaticProps;
     if (*(volatile int *)kClsState != 0 && !*(volatile int *)kSvActive && s_server && vt == (void **)0x2017549C &&
         vt[2] == (void *)0x200E8CE0 && vt[5] == (void *)0x200E9030 && *(volatile BYTE *)(kStaticProps + 92)) {
@@ -1303,18 +1383,22 @@ static void __cdecl client_frame() {
     if (s_server) {
         uint32_t work = s_pending_work.load(std::memory_order_acquire);
         bool can_run_cmds = (*(volatile int *)kClsState == 4) && local_player_ready();
-        uint32_t drain_mask = 5u | (can_run_cmds ? 2u : 0u);
+        bool can_show_infobar = (*(volatile int *)kClsState >= 3);
+        uint32_t drain_mask = 5u | (can_run_cmds ? 2u : 0u) | (can_show_infobar ? 16u : 0u);
         if (work & drain_mask) {
             std::vector<std::string> lines, cmds;
+            std::vector<InfoBarMsg> infobars;
             std::string save_client;
             long save_id = 0;
             EnterCriticalSection(&s_cs);
             lines.swap(s_to_console);
             if (can_run_cmds) cmds.swap(s_from_server);
+            if (can_show_infobar) infobars.swap(s_infobar_msgs);
             save_client.swap(s_save_client_req);
             save_id = s_save_client_id;
             s_pending_work.fetch_and(~drain_mask, std::memory_order_release);
             LeaveCriticalSection(&s_cs);
+            for (const InfoBarMsg &m : infobars) show_infobar_msg(m);
             if (!save_client.empty()) {
                 int saved_ok = 0;
                 void *sr = *(void *volatile *)0x201A44E8;
@@ -1351,7 +1435,8 @@ static void __cdecl client_frame() {
                     EnterCriticalSection(&s_cs);
                     s_preload_req.clear();
                     s_from_server.clear();
-                    s_pending_work.fetch_and(~10u, std::memory_order_release);
+                    s_infobar_msgs.clear();
+                    s_pending_work.fetch_and(~26u, std::memory_order_release);
                     LeaveCriticalSection(&s_cs);
                     // "disconnect" takes the loading screen down and shows the menu. The console stays as it
                     // is, as when a load fails in single player ("toggleconsole" opened it over the menu, or
@@ -1405,7 +1490,8 @@ static void __cdecl client_frame() {
                 s_preload_req.clear();
                 s_save_client_req.clear();
                 s_from_server.clear();
-                s_pending_work.fetch_and(~14u, std::memory_order_release);
+                s_infobar_msgs.clear();
+                s_pending_work.fetch_and(~30u, std::memory_order_release);
                 LeaveCriticalSection(&s_cs);
                 // back to the menu, with the console open so the message above is seen
                 Cbuf_AddText("disconnect\ntoggleconsole\n");
@@ -1453,7 +1539,8 @@ static void __cdecl client_frame() {
                         close_dialog_window();
                         EnterCriticalSection(&s_cs);
                         s_from_server.clear();
-                        s_pending_work.fetch_and(~2u, std::memory_order_release);
+                        s_infobar_msgs.clear();
+                        s_pending_work.fetch_and(~18u, std::memory_order_release);
                         LeaveCriticalSection(&s_cs);
                         std::string short_map = preload;
                         if (short_map.rfind("maps/", 0) == 0) short_map = short_map.substr(5);
@@ -1667,6 +1754,20 @@ void install_split_client(HMODULE engine) {
                        !memcmp((void *)0x20090EC9, kMapValidSite, sizeof(kMapValidSite));
     s_cl_disconnect_ok = in_module_image(engine, 0x267B0, sizeof(kClDisconnectBytes)) &&
                          !memcmp((void *)0x200267B0, kClDisconnectBytes, sizeof(kClDisconnectBytes));
+    {
+        static const BYTE kClPausedWrite[] = {0xA3, 0x74, 0x48, 0x31, 0x20};
+        static const BYTE kVPauseCount[] = {0xA1, 0x88, 0x37, 0xB4, 0x20};
+        static const BYTE kVPauseFlag[] = {0xC7, 0x05, 0x10, 0x35, 0xD6, 0x20, 0x01, 0x00, 0x00, 0x00};
+        static const BYTE kSetPauseCount[] = {0xA1, 0x8C, 0x37, 0xB4, 0x20};
+        s_pause_addrs_ok = in_module_image(engine, 0x2D137, sizeof(kClPausedWrite)) &&
+                           in_module_image(engine, 0x918A9, sizeof(kVPauseCount)) &&
+                           in_module_image(engine, 0x918BB, sizeof(kVPauseFlag)) &&
+                           in_module_image(engine, 0x9199B, sizeof(kSetPauseCount)) &&
+                           memcmp((const BYTE *)engine + 0x2D137, kClPausedWrite, sizeof(kClPausedWrite)) == 0 &&
+                           memcmp((const BYTE *)engine + 0x918A9, kVPauseCount, sizeof(kVPauseCount)) == 0 &&
+                           memcmp((const BYTE *)engine + 0x918BB, kVPauseFlag, sizeof(kVPauseFlag)) == 0 &&
+                           memcmp((const BYTE *)engine + 0x9199B, kSetPauseCount, sizeof(kSetPauseCount)) == 0;
+    }
     if (!s_loading_screen) log("split: loading screen not shown (unknown engine code)");
     static const BYTE kFpsMaxRead[] = {0x8B, 0x0D, 0x84, 0x28, 0xB4, 0x20, 0x8B, 0x51, 0x28};
     if (in_module_image(engine, 0x8BA5F, sizeof(kFpsMaxRead)) &&
