@@ -76,8 +76,8 @@ to 8 GB combined), while Direct3D 9Ex keeps textures and meshes outside both:
 
 Known limitations of the experimental split mode:
 
-- Movement goes through the local server without client-side prediction (~1 frame / ~12 ms added
-  input latency on movement; mouse look remains immediate).
+- Movement goes through the local server without client-side prediction (movement is shown
+  about 15 to 20 ms late, up to 40 ms at 30 fps; mouse look remains immediate).
 - BLSE plugins that need both halves of the game must support BLSE's split link; other loader plugins
   still load in both processes.
 - Client state (`.HL2` map decals and client entities) is written through a save handshake with the

@@ -67,6 +67,74 @@ int scan_stack(void **sp, char *out, size_t n, int max) {
     return found;
 }
 
+// ---- another thread's position ----
+// No heap, lock, log or exception is used while the thread is suspended: it may hold any of those locks.
+bool sample_thread(HANDLE thread, void *stack_base, ThreadSample &s) {
+    s.ip = nullptr;
+    s.words = 0;
+    if (!thread || SuspendThread(thread) == (DWORD)-1) return false;
+    CONTEXT c;
+    c.ContextFlags = CONTEXT_CONTROL;
+    bool ok = GetThreadContext(thread, &c) != 0;
+    if (ok) {
+        s.ip = (void *)c.Eip;
+        uintptr_t sp = c.Esp & ~3u, base = (uintptr_t)stack_base;
+        SIZE_T len = base > sp ? base - sp : 0, got = 0;
+        if (len > sizeof(s.stack)) len = sizeof(s.stack);
+        if (len && ReadProcessMemory(GetCurrentProcess(), (void *)sp, s.stack, len, &got)) s.words = (int)(got / sizeof(void *));
+    }
+    ResumeThread(thread);
+    return ok;
+}
+
+void describe_mapped(void *addr, char *out, size_t n) {
+    if (!out || n == 0) return;
+    MEMORY_BASIC_INFORMATION mbi;
+    char name[MAX_PATH];
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+        GetMappedFileNameA(GetCurrentProcess(), addr, name, MAX_PATH)) {
+        name[MAX_PATH - 1] = 0;
+        const char *base = strrchr(name, '\\');
+        snprintf(out, n, "%s+%x", base ? base + 1 : name, (unsigned)((uintptr_t)addr - (uintptr_t)mbi.AllocationBase));
+    } else {
+        snprintf(out, n, "%p", addr);
+    }
+}
+
+int scan_words(void *const *words, int count, char *out, size_t n, int max) {
+    if (!out || n == 0) return 0;
+    size_t len = 0;
+    int found = 0;
+    out[0] = 0;
+    uintptr_t lo = 1, hi = 0;   // the last region looked up, and whether it is code
+    bool code = false;
+    for (int i = 0; i < count && found < max; ++i) {
+        uintptr_t p = (uintptr_t)words[i];
+        if (p < 0x10007) continue;
+        if (p - 7 < lo || p - 7 >= hi) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((void *)(p - 7), &mbi, sizeof(mbi))) continue;
+            lo = (uintptr_t)mbi.BaseAddress;
+            hi = lo + mbi.RegionSize;
+            code = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                   (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+        }
+        if (!code) continue;
+        BYTE b[7];   // the bytes before the address
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), (void *)(p - 7), b, sizeof(b), &got) || got != sizeof(b)) continue;
+        if (!(b[2] == 0xE8 || (b[5] == 0xFF && (b[6] & 0x38) == 0x10) || (b[4] == 0xFF && (b[5] & 0x38) == 0x10) ||
+              (b[1] == 0xFF && (b[2] & 0x38) == 0x10) || (b[0] == 0xFF && (b[1] & 0x38) == 0x10))) continue;
+        char one[96];
+        describe_mapped((void *)p, one, sizeof(one));
+        int w = snprintf(out + len, n - len, found ? " %s" : "%s", one);
+        if (w < 0 || (size_t)w >= n - len) { out[len] = 0; break; }
+        len += (size_t)w;
+        ++found;
+    }
+    return found;
+}
+
 static void trace(const char *what, SIZE_T size, void *result) {
     if (g_in_trace) return;   // no nesting on this thread (logging allocates)
     DWORD err = GetLastError();

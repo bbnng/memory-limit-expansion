@@ -11,11 +11,15 @@
 // Console commands arrive on a named pipe (\\.\pipe\vtmb-memx-<name>, -memx_pipe <name>, default
 // "server"), one command per line, and are run between frames.
 #include "common.h"
+#include "split_activity_timer.h"
+#include "split_ironsights.h"
 #include "split_load_watch.h"
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <mmsystem.h>
@@ -160,14 +164,62 @@ static bool status_write(const char *text);
 // ---- the main loop's progress ----
 // The game process sees the world only through this process's snapshots and stdout. The main loop sends
 // "memx:alive" once a second (the game ends a server that stops sending it, split_client.cpp) and notes
-// what it is doing, so a stall is logged with where it happened.
+// what it is doing, so a stall is logged with where it happened: also the main thread's position and likely
+// callers, every 5 s and so a few times before the game gives the server up.
 static volatile DWORD s_loop_tick;          // GetTickCount() when the main loop last went round
 static const char *volatile s_loop_step = "starting";
+static HANDLE s_main_thread;                // the thread that runs the main loop
+static void *s_main_stack_base;
+static const DWORD kStallSampleMs = 5000;
+static const DWORD kStallSamples = 4;       // per stall
+
+// A stack overflow leaves its thread too little stack to log it: it hands that to the watch thread.
+static HANDLE s_overflow_event, s_overflow_logged;
+static void *volatile s_overflow_ip;
+static void **volatile s_overflow_sp;
+
+static ULONGLONG thread_cpu_ms(HANDLE thread) {
+    FILETIME created, exited, kernel, user;
+    if (!thread || !GetThreadTimes(thread, &created, &exited, &kernel, &user)) return 0;
+    auto value = [](const FILETIME &t) { return ((ULONGLONG)t.dwHighDateTime << 32) | t.dwLowDateTime; };
+    return (value(kernel) + value(user)) / 10000;
+}
+
+static void log_main_thread(DWORD stalled, DWORD cpu_ms, DWORD over_ms) {
+    static ThreadSample sample;   // the watch thread's only
+    char where[96], callers[860];
+    if (!sample_thread(s_main_thread, s_main_stack_base, sample)) return;
+    describe_mapped(sample.ip, where, sizeof(where));
+    scan_words(sample.stack, sample.words, callers, sizeof(callers), 32);
+    log("server: stalled %lu s (in: %s): main thread at %s, used %lu ms of CPU in the last %lu ms", stalled / 1000, s_loop_step, where,
+        cpu_ms, over_ms);
+    log("server: likely callers: %s", callers);
+}
+
+static void log_stack_overflow() {
+    static void *words[4096];
+    char where[96], callers[860];
+    SIZE_T got = 0;
+    ReadProcessMemory(GetCurrentProcess(), (void *)s_overflow_sp, words, sizeof(words), &got);
+    describe_mapped(s_overflow_ip, where, sizeof(where));
+    scan_words(words, (int)(got / sizeof(void *)), callers, sizeof(callers), 32);
+    log("server: stack overflow at %s", where);
+    log("server: likely callers: %s", callers);
+}
+
 static DWORD WINAPI loop_watch_thread(void *) {
     DWORD reported = 0;
+    DWORD samples = 0;
     DWORD broken_since = 0;
+    DWORD cpu_tick = GetTickCount();
+    ULONGLONG cpu = thread_cpu_ms(s_main_thread);
     for (;;) {
-        Sleep(1000);
+        if (!s_overflow_event) {
+            Sleep(1000);
+        } else if (WaitForSingleObject(s_overflow_event, 1000) == WAIT_OBJECT_0) {
+            log_stack_overflow();
+            if (s_overflow_logged) SetEvent(s_overflow_logged);
+        }
         if (s_stdout && s_stdout_broken) {
             DWORD now = GetTickCount();
             if (!broken_since) broken_since = now ? now : 1;
@@ -180,6 +232,15 @@ static DWORD WINAPI loop_watch_thread(void *) {
         if (!tick) continue;
         DWORD now = GetTickCount();
         DWORD stalled = (int)(now - tick) > 0 ? (now - tick) : 0;
+        ULONGLONG cpu_now = thread_cpu_ms(s_main_thread);
+        if (stalled < kStallSampleMs) {
+            samples = 0;
+        } else if (samples < kStallSamples && stalled >= kStallSampleMs * (samples + 1)) {
+            samples = stalled / kStallSampleMs;
+            log_main_thread(stalled, (DWORD)(cpu_now - cpu), now - cpu_tick);
+        }
+        cpu = cpu_now;
+        cpu_tick = now;
         if (stalled >= 10000 && stalled / 10000 != reported) {
             reported = stalled / 10000;
             log("server: the main loop has not gone round for %lu s (in: %s)", stalled / 1000, s_loop_step);
@@ -213,8 +274,8 @@ static int WINAPI server_message_box_w(HWND, LPCWSTR text, LPCWSTR caption, UINT
     log("server: message box not shown (this process has no window): \"%s\": %s", c, t);
     return message_box_answer(type);
 }
-// user32's export (modules loaded later) and the import slots of the modules loaded so far
-static int patch_user32_module(BYTE *base, void *old_fn, void *new_fn) {
+// a system DLL's export (modules loaded later) and the import slots of the modules loaded so far
+static int patch_module_import(BYTE *base, const char *dll, void *old_fn, void *new_fn) {
     int count = 0;
     __try {
         auto dos = (IMAGE_DOS_HEADER *)base;
@@ -228,7 +289,7 @@ static int patch_user32_module(BYTE *base, void *old_fn, void *new_fn) {
         for (auto imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress);
              (DWORD)((BYTE *)imp - base) + sizeof(*imp) <= img_size && imp->Name; ++imp) {
             if (!imp->FirstThunk || imp->Name >= img_size || imp->FirstThunk >= img_size) continue;
-            if (_stricmp((char *)(base + imp->Name), "user32.dll") != 0) continue;
+            if (_stricmp((char *)(base + imp->Name), dll) != 0) continue;
             for (auto th = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
                  (DWORD)((BYTE *)th - base) + sizeof(*th) <= img_size && th->u1.Function; ++th) {
                 if ((void *)th->u1.Function != old_fn) continue;
@@ -243,11 +304,11 @@ static int patch_user32_module(BYTE *base, void *old_fn, void *new_fn) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return count;
 }
-static int patch_user32_imports(const char *name, void *old_fn, void *new_fn) {
+static int patch_dll_imports(const char *dll, void *old_fn, void *new_fn) {
     int count = 0;
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&patch_user32_imports, &self);
+                       (LPCWSTR)&patch_dll_imports, &self);
     HMODULE mods[512];
     DWORD needed = 0;
     typedef BOOL(WINAPI * EnumMods_t)(HANDLE, HMODULE *, DWORD, LPDWORD);
@@ -255,9 +316,8 @@ static int patch_user32_imports(const char *name, void *old_fn, void *new_fn) {
     if (!enum_mods || !enum_mods(GetCurrentProcess(), mods, sizeof(mods), &needed)) return 0;
     for (DWORD m = 0; m < needed / sizeof(HMODULE) && m < 512; ++m) {
         if (mods[m] == self) continue;
-        count += patch_user32_module((BYTE *)mods[m], old_fn, new_fn);
+        count += patch_module_import((BYTE *)mods[m], dll, old_fn, new_fn);
     }
-    (void)name;
     return count;
 }
 static void install_message_box_guard() {
@@ -272,11 +332,39 @@ static void install_message_box_guard() {
         if (!cur) continue;
         if ((void *)cur == h.fn) continue;
         if (!patch_export(user32, h.name, h.fn, &old)) continue;
-        slots += patch_user32_imports(h.name, (void *)cur, h.fn);
+        slots += patch_dll_imports("user32.dll", (void *)cur, h.fn);
     }
     log("server: message boxes are logged instead of shown (%d import slots)", slots);
 }
+
+// The display settings (HKCU\Software\Troika\Vampire\Settings) are the game's alone. Options Console
+// (options-console.vtm) puts the saved ones back there whenever engine.dll is loaded, so in this process too, while
+// the game is still starting up: one started with -noborder, which asks for other ones for that session, then found
+// the saved ones again, took their size and never became borderless. Here they count as written, and are not.
+typedef LSTATUS(WINAPI *RegSetValueExA_t)(HKEY, LPCSTR, DWORD, DWORD, const BYTE *, DWORD);
+static RegSetValueExA_t s_reg_set_value;
+static LSTATUS WINAPI server_reg_set_value(HKEY key, LPCSTR name, DWORD reserved, DWORD type, const BYTE *data, DWORD size) {
+    static const char *const kDisplay[] = {"ScreenWidth", "ScreenHeight", "ScreenBPP", "ScreenWindowed"};
+    for (const char *d : kDisplay)
+        if (name && _stricmp(name, d) == 0) return ERROR_SUCCESS;
+    return s_reg_set_value(key, name, reserved, type, data, size);
+}
+static void install_display_settings_guard() {
+    HMODULE advapi = GetModuleHandleW(L"advapi32.dll");
+    if (!advapi) advapi = LoadLibraryW(L"advapi32.dll");
+    FARPROC cur = advapi ? GetProcAddress(advapi, "RegSetValueExA") : nullptr;
+    if (!cur || (void *)cur == (void *)server_reg_set_value) return;
+    s_reg_set_value = (RegSetValueExA_t)cur;
+    void *old = nullptr;
+    if (!patch_export(advapi, "RegSetValueExA", (void *)server_reg_set_value, &old)) {
+        log("server: not patched: display settings are left to the game");
+        return;
+    }
+    int slots = patch_dll_imports("advapi32.dll", (void *)cur, (void *)server_reg_set_value);
+    if (g_settings.verbose) log("server: display settings are left to the game (%d import slots)", slots);
+}
 static size_t add_game_cmds(const std::string &line);
+static void release_chargen_hold(const char *why);
 static bool client_signing_on(int *seq_out = nullptr);
 static bool s_ran_frame = false;
 static LARGE_INTEGER s_last_frame_qpc = {};
@@ -365,6 +453,147 @@ static void reset_server_pause_state() {
     *(volatile int *)0x20B4378C = 0;   // setpause_count
     *(volatile int *)0x20D63510 = 0;   // v_paused_flag
     *(volatile int *)0x212B0758 = 0;   // sv.paused
+}
+
+// ---- NPCs the player may see think at full rate ----
+// CAI_BaseNPCTroika thinks (moves, and advances its animation) every 0.1 s only while it counts as visible. In the
+// player's potentially visible set but hidden it thinks every 0.3 s, outside of that set every 1 s, and both grow
+// with the distance (up to 6 and 16 s; CalcNextNormalThink, vampire.dll+0x290B60). Whether it is visible it works
+// out itself, in one of those thinks, and at most every 2 s (+0x291610). So an NPC that came into view (around a
+// corner, or right after a level change or load, when the first checks are still to come) went on moving in steps of
+// 0.3 to 1 s for up to 3 s: the game process glided it to the new place with its legs standing still.
+// Before each world frame, an NPC in the player's potentially visible set (the game's own test) whose next think is
+// more than 0.1 s after its last one gets it moved up, and re-checks its visibility there if it counted as outside.
+// One whose next think was set by anything but its own scheduling (dying, disabled, scripted) is left alone.
+struct NpcThinkCode {
+    BYTE *vampire;
+    int(__cdecl *in_player_pvs)(void *player, void *npc);   // vampire.dll+0x1D1A90; the result is the low byte
+    void *(__cdecl *player_by_index)(int index);            // vampire.dll+0x1CD9E0
+};
+static NpcThinkCode s_npc_think;       // vampire null: unknown code or not looked at yet
+static float s_npc_scan_time;          // world time of the last scan
+static std::unordered_map<void *, bool> s_npc_classes;   // vtable -> derived from CAI_BaseNPCTroika
+
+static void check_npc_think(HMODULE vampire) {
+    s_npc_think = {};
+    s_npc_classes.clear();
+    if (!in_module_image(vampire, 0xA000, 0x2DF000) || !in_module_image(vampire, 0x566458, 4) ||
+        !in_module_image(vampire, 0x5A0128, 4) || !in_module_image(vampire, 0x70B228, 4)) {
+        log("server: NPC think rate not changed (unknown vampire.dll)");
+        return;
+    }
+    BYTE *b = (BYTE *)vampire;
+    auto bytes = [b](DWORD rva, std::initializer_list<BYTE> want) { return memcmp(b + rva, want.begin(), want.size()) == 0; };
+    auto address = [b](DWORD rva, DWORD target) {
+        DWORD v;
+        memcpy(&v, b + rva, 4);
+        return v == (DWORD)(uintptr_t)(b + target);
+    };
+    bool ok = bytes(0x290D1C, {0xD9, 0x85, 0x48, 0x62, 0x00, 0x00, 0xD8, 0xA5, 0x58, 0x62, 0x00, 0x00}) &&   // next, last normal think
+              bytes(0x2906A0, {0x8B, 0x81, 0x44, 0x62, 0x00, 0x00}) &&                                      // next update think
+              bytes(0x2936C0, {0xD9, 0x9E, 0x7C, 0x01, 0x00, 0x00, 0x84, 0xC0}) &&                          // m_flNextThink
+              bytes(0xAC558, {0x89, 0x86, 0x18, 0x01, 0x00, 0x00}) &&                                       // m_pfnThink
+              bytes(0x29175D, {0x88, 0x86, 0x78, 0x62, 0x00, 0x00}) &&                                      // in the player's PVS
+              bytes(0x2916E9, {0xD9, 0x9E, 0x84, 0x62, 0x00, 0x00}) &&                                      // next visibility check
+              bytes(0xF4E8, {0xE9, 0x53, 0x07, 0x27, 0x00}) &&                                              // NPCThink (a virtual call)
+              bytes(0x27FC40, {0x8B, 0x01, 0xFF, 0xA0, 0xBC, 0x06, 0x00, 0x00}) &&
+              bytes(0x1D1A96, {0xB0, 0x01, 0x83, 0xEC, 0x30, 0x84, 0xC8, 0x75, 0x35}) &&                    // the PVS test
+              bytes(0x1D1B6E, {0x3B, 0x05}) && address(0x1D1B70, 0x5A0128) &&                               // ... its last cluster
+              bytes(0x1CD9EB, {0x8B, 0x0D}) && address(0x1CD9ED, 0x70B228) &&                               // player by index; gpGlobals
+              bytes(0x1CD9F1, {0x3B, 0x41, 0x14}) &&
+              bytes(0x290C50, {0xA1}) && address(0x290C51, 0x566458) && bytes(0x290C55, {0x8D, 0x44, 0x90, 0x04});   // entity list
+    if (!ok) {
+        log("server: NPC think rate not changed (unknown vampire.dll)");
+        return;
+    }
+    s_npc_think.in_player_pvs = (int(__cdecl *)(void *, void *))(b + 0x1D1A90);
+    s_npc_think.player_by_index = (void *(__cdecl *)(int))(b + 0x1CD9E0);
+    s_npc_think.vampire = b;
+}
+
+// The class of an object with this vtable derives from CAI_BaseNPCTroika (vampire.dll's RTTI).
+static bool npc_class_from_rtti(void **vtable) {
+    HMODULE m = (HMODULE)s_npc_think.vampire;
+    auto inside = [m](const void *p, DWORD len) {
+        return (uintptr_t)p >= (uintptr_t)m && in_module_image(m, (DWORD)((uintptr_t)p - (uintptr_t)m), len);
+    };
+    if (!inside(vtable - 1, 8)) return false;
+    const DWORD *col = (const DWORD *)vtable[-1];   // +0 signature, +4 offset, +12 type, +16 class hierarchy
+    if (!inside(col, 20) || col[0] != 0 || col[1] != 0) return false;
+    const DWORD *hierarchy = (const DWORD *)col[4];   // +8 number of base classes, +12 their array
+    if (!inside(hierarchy, 16) || hierarchy[2] > 64) return false;
+    const DWORD *const *bases = (const DWORD *const *)hierarchy[3];
+    if (!inside(bases, hierarchy[2] * 4)) return false;
+    static const char kName[] = ".?AVCAI_BaseNPCTroika@@";
+    for (DWORD i = 0; i < hierarchy[2]; ++i) {
+        if (!inside(bases[i], 4)) return false;
+        const char *type = (const char *)bases[i][0];   // +8 name
+        if (inside(type, 8 + sizeof(kName)) && memcmp(type + 8, kName, sizeof(kName)) == 0) return true;
+    }
+    return false;
+}
+
+static void scan_npc_thinks() {
+    BYTE *b = s_npc_think.vampire;
+    const BYTE *globals = *(BYTE *volatile *)(b + 0x70B228);
+    BYTE *list = *(BYTE *volatile *)(b + 0x566458);
+    if (!globals || !list) return;
+    float now = *(const float *)(globals + 12);   // curtime
+    if (now >= s_npc_scan_time && now - s_npc_scan_time < 0.03f) return;
+    s_npc_scan_time = now;
+    void *player = s_npc_think.player_by_index(1);
+    if (!player) return;
+    for (int i = 2; i < 2048; ++i) {
+        BYTE *npc = *(BYTE **)(list + 12 * i + 4);
+        if (!npc || *(void **)(npc + 0x118) != b + 0xF4E8) continue;   // m_pfnThink is not NPCThink
+        float &next_think = *(float *)(npc + 0x17C);
+        if (!(next_think > now)) continue;   // due now, or none (0)
+        void **vtable = *(void ***)npc;
+        auto known = s_npc_classes.find(vtable);
+        if (known == s_npc_classes.end()) known = s_npc_classes.emplace(vtable, npc_class_from_rtti(vtable)).first;
+        if (!known->second) continue;
+        float &next_normal = *(float *)(npc + 0x6248);
+        float next_update = *(const float *)(npc + 0x6244);
+        if (!(fabsf(next_think - (next_update < next_normal ? next_update : next_normal)) < 0.02f)) continue;
+        float due = *(const float *)(npc + 0x6258) + 0.1f;   // last normal think
+        if (!(due > now)) due = now;
+        if (!(next_normal - due > 0.02f)) continue;
+        if (!(s_npc_think.in_player_pvs(player, npc) & 0xFF)) continue;
+        next_normal = due;
+        if (due < next_think) next_think = due;
+        if (!npc[0x6278]) *(float *)(npc + 0x6284) = now;   // visibility check in that think
+    }
+}
+
+static void wake_visible_npcs() {
+    static bool failed;
+    if (!s_npc_think.vampire || failed) return;
+    __try {
+        scan_npc_thinks();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        failed = true;
+        log("server: NPC think rate: unexpected data; left to the game from now on");
+    }
+}
+
+// A new level: the PVS test keeps the last cluster it saw, which may be a number of the old level's.
+static void reset_npc_thinks() {
+    s_npc_scan_time = 0.0f;
+    if (s_npc_think.vampire) *(volatile int *)(s_npc_think.vampire + 0x5A0128) = -2;
+}
+
+// ---- the iron sights plugin (split_ironsights.h) ----
+// "memx:ironspread <float, hex>": the spread multiplier the game's view worked out, for the player's weapons here
+static void set_ironsights_spread(const char *hex) {
+    BYTE *vampire = ironsights_vampire();
+    if (!vampire) return;
+    DWORD bits = strtoul(hex, nullptr, 16);
+    float spread;
+    memcpy(&spread, &bits, 4);
+    if (!(spread >= 0.0f && spread <= 100.0f)) return;
+    *(volatile DWORD *)(vampire + kIronSightsSpread) = bits;
+    *(volatile DWORD *)(vampire + kIronSightsResend) = 1;
+    if (g_settings.verbose) log("server: iron sights spread x%.3f", spread);
 }
 
 // ---- what the engine still has to do for a level command (split_load_watch.h) ----
@@ -493,6 +722,7 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
             12,
             "server: rope endpoints stay transmitted"};
         apply_patch(vamp, kRopeTransmit);
+        check_npc_think(vamp);
     }
     install_spew_tap();
     install_null_client();
@@ -512,6 +742,10 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
     QueryPerformanceFrequency(&s_qpc_freq);
     if (HANDLE t = CreateThread(nullptr, 0, pipe_thread, nullptr, 0, nullptr)) CloseHandle(t);
     s_loop_tick = GetTickCount();
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &s_main_thread, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    s_main_stack_base = ((NT_TIB *)NtCurrentTeb())->StackBase;
+    s_overflow_logged = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    s_overflow_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (HANDLE t = CreateThread(nullptr, 0, loop_watch_thread, nullptr, 0, nullptr)) CloseHandle(t);
     DWORD last_alive = 0;
     timeBeginPeriod(1);
@@ -558,6 +792,14 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
                 }
                 if (c.rfind("memx:loadid ", 0) == 0) {
                     load_id = atol(c.c_str() + 12);
+                    continue;
+                }
+                if (c == "memx:cmddone") {
+                    release_chargen_hold("the game has run the command");
+                    continue;
+                }
+                if (c.rfind("memx:ironspread ", 0) == 0) {
+                    set_ironsights_spread(c.c_str() + 16);
                     continue;
                 }
                 // the game's aliases come before every new game or load (split_client.cpp): not logged one by one
@@ -683,19 +925,28 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
 
 static LauncherAPI s_launcher_api;
 
-// Server mode only: the first access violations are logged with their callers (the dedicated path is
-// code Bloodlines never ran, so this is how its next missing piece shows up).
-static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
-    static volatile LONG count;
-    static __declspec(thread) bool in_veh;
-    if (in_veh || e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || InterlockedIncrement(&count) > 4)
-        return EXCEPTION_CONTINUE_SEARCH;
-    in_veh = true;
+// Server mode only: the first access violations and other fatal faults are logged with their callers (the
+// dedicated path is code Bloodlines never ran, so this is how its next missing piece shows up).
+static const char *fault_name(DWORD code) {
+    switch (code) {
+    case EXCEPTION_ILLEGAL_INSTRUCTION: return "illegal instruction";
+    case EXCEPTION_PRIV_INSTRUCTION: return "privileged instruction";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO: return "integer division by zero";
+    case EXCEPTION_INT_OVERFLOW: return "integer division overflow";
+    case EXCEPTION_IN_PAGE_ERROR: return "in-page error";
+    case EXCEPTION_BREAKPOINT: return "breakpoint";
+    }
+    return nullptr;
+}
+static __declspec(noinline) void log_fault(EXCEPTION_POINTERS *e, const char *name) {
     char where[96], stack[700];
     describe_address(e->ExceptionRecord->ExceptionAddress, where, sizeof(where));
     scan_stack((void **)e->ContextRecord->Esp, stack, sizeof(stack), 12);
-    log("server: access violation at %s (%s %p) | callers: %s", where, e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
-        (void *)e->ExceptionRecord->ExceptionInformation[1], stack);
+    if (name)
+        log("server: %s at %s | callers: %s", name, where, stack);
+    else
+        log("server: access violation at %s (%s %p) | callers: %s", where, e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+            (void *)e->ExceptionRecord->ExceptionInformation[1], stack);
     // text on the stack near the fault (overflowed buffers show what overflowed them)
     char text[400];
     int n = 0;
@@ -708,6 +959,31 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     }
     text[n] = 0;
     log("server: stack text: %s", text);
+}
+// This frame stays small: after a stack overflow little stack is left.
+static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
+    static volatile LONG violations, faults, overflows;
+    static __declspec(thread) bool in_veh;
+    DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_STACK_OVERFLOW) {
+        if (s_overflow_event && InterlockedIncrement(&overflows) == 1) {
+            s_overflow_ip = e->ExceptionRecord->ExceptionAddress;
+            s_overflow_sp = (void **)e->ContextRecord->Esp;
+            SetEvent(s_overflow_event);
+            if (s_overflow_logged) WaitForSingleObject(s_overflow_logged, 2000);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (in_veh) return EXCEPTION_CONTINUE_SEARCH;
+    const char *name = nullptr;
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        if (InterlockedIncrement(&violations) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    } else {
+        name = fault_name(code);
+        if (!name || InterlockedIncrement(&faults) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    }
+    in_veh = true;
+    log_fault(e, name);
     in_veh = false;
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -841,6 +1117,11 @@ static const CodePatch kPlayerPatches[] = {
     {0x91955, {0x84, 0xC0, 0x74, 0x79}, {0x0C, 0x01, 0x74, 0x79}, 4, "server: setpause"},
     {0x919E5, {0x84, 0xC0, 0x0F, 0x84}, {0x0C, 0x01, 0x0F, 0x84}, 4, "server: unpause"},
     {0x918A5, {0x84, 0xC0, 0x74, 0x4B}, {0x0C, 0x01, 0x74, 0x4B}, 4, "server: v_setpause"},
+    // CEngineClient::GetLevelName (0x2001B800) answers "Dedicated Server" without a local client. Plugins of the
+    // world's code ask it which map runs (protean-frenzy-improved.vtm: its GriffithFrenzyCollision never started):
+    // sv.modelname (0x212B07E8, "maps/<map>.bsp"), which stands for what the client says in single player
+    // (0x2001B836: mov eax,20197964h; pop esi; ret)
+    {0x1B836, {0xB8, 0x64, 0x79, 0x19, 0x20, 0x5E, 0xC3}, {0xB8, 0xE8, 0x07, 0x2B, 0x21, 0x5E, 0xC3}, 7, "server: level name"},
 };
 
 // ---- commands of the game process ----
@@ -867,6 +1148,31 @@ static size_t add_game_cmds(const std::string &line) {
     ReleaseSRWLockExclusive(&s_cmd_lock);
     return n;
 }
+// Character Creation. On a new game's first map the world runs "createplayer" the moment the player exists, a
+// command of client.dll: it builds the Character Creation screen, which pauses the world ("v_setpause"). In single
+// player all of that happens before the world's next frame. Here the command first travels to the game process, so
+// the world would go on without it, and the player (who starts in the air) would fall 0.45 s later into the trigger
+// that ends the map. So from the moment the command leaves until the game has run it ("memx:cmddone", sent after
+// the pause on the same pipe), the world stands still.
+static bool s_chargen_hold;
+static DWORD s_chargen_hold_tick;
+static const DWORD kChargenHoldMs = 30000;   // the game process never answered (an older build, or it is stuck)
+static void begin_chargen_hold() {
+    s_chargen_hold = true;
+    s_chargen_hold_tick = GetTickCount();
+    log("server: the world waits for Character Creation");
+}
+static void release_chargen_hold(const char *why) {
+    if (!s_chargen_hold) return;
+    s_chargen_hold = false;
+    log("server: the world goes on after %lu ms: %s", GetTickCount() - s_chargen_hold_tick, why);
+}
+static bool chargen_holds_world() {
+    if (s_chargen_hold && GetTickCount() - s_chargen_hold_tick >= kChargenHoldMs)
+        release_chargen_hold("no answer from the game");
+    return s_chargen_hold;
+}
+
 typedef int(__cdecl *PyConsole_t)(const char *);
 static int __cdecl server_unknown_text(const char *text) {
     if (!text) return ((PyConsole_t)0x200DAB20)(text);
@@ -883,7 +1189,7 @@ static int __cdecl server_unknown_text(const char *text) {
         for (const char *p = text; *p && *p != '\r' && *p != '\n' && clean.size() < 980; ++p) clean += *p;
         if (!clean.empty()) {
             std::string line = "memx:cmd " + clean + "\n";
-            status_write(line.c_str());
+            if (status_write(line.c_str()) && first == "createplayer") begin_chargen_hold();
         }
         return 0;
     }
@@ -1066,6 +1372,25 @@ static int __cdecl world_should_run() {
     return 0;
 }
 
+// SV_Frame's own test. Nothing but the world's frames stops for Character Creation: snapshots still go out.
+static int __cdecl world_frame_should_run() {
+    if (!world_should_run()) {
+        s_chargen_hold = false;   // the player it was for is gone
+        return 0;
+    }
+    return chargen_holds_world() ? 0 : 1;
+}
+static __declspec(naked) int world_frame_should_run_saved() {
+    __asm {
+        push ecx
+        push edx
+        call world_frame_should_run
+        pop edx
+        pop ecx
+        ret
+    }
+}
+
 // world_should_run for code that keeps values in ecx/edx across the test
 static __declspec(naked) int world_should_run_saved() {
     __asm {
@@ -1078,11 +1403,11 @@ static __declspec(naked) int world_should_run_saved() {
     }
 }
 
-static CodePatch make_gate_patch(HMODULE engine, DWORD rva, DWORD run_rva, DWORD skip_rva, BYTE skip_disp, const char *what) {
+static CodePatch make_gate_patch(HMODULE engine, DWORD rva, DWORD run_rva, DWORD skip_rva, BYTE skip_disp, const void *test, const char *what) {
     CodePatch p = {rva, {0xA1, 0x50, 0xBE, 0x1D, 0x20, 0x83, 0xF8, 0x04, 0x74, 0x04, 0x85, 0xC0, 0x75, skip_disp},
                    {0xE8, 0, 0, 0, 0, 0x85, 0xC0, 0x75, (BYTE)(run_rva - (rva + 9)), 0xEB, (BYTE)(skip_rva - (rva + 11)), 0x90, 0x90, 0x90},
                    14, what};
-    DWORD rel = (DWORD)((uintptr_t)world_should_run_saved - ((uintptr_t)engine + rva + 5));
+    DWORD rel = (DWORD)((uintptr_t)test - ((uintptr_t)engine + rva + 5));
     memcpy(p.repl + 1, &rel, 4);
     return p;
 }
@@ -1120,10 +1445,10 @@ static bool client_signing_on(int *seq_out) {
 // first parse takes > 1 server frame), CL_Parse_EntityMessage drops every key (GetClientNetworkable == NULL)
 // or the retry full update destroys/recreates C_ItemGKeyring empty, crashing client.dll+0x38b9 on the next
 // key removal + pickup. Keep ignore=1 in SV_ProcessUsercmds until the client is active AND its initial full
-// update is acknowledged in the exact way SV_ReadPackets checks it, with a 5 s safety fallback.
+// update is acknowledged in the exact way SV_ReadPackets checks it, with a safety fallback after 5 s in which
+// the client's packets arrive (a client busy on its first frame sends none: split_activity_timer.h).
 static int s_snapshot_acked_spawn = -1;
-static int s_active_seen_spawn = -1;
-static DWORD s_active_seen_tick = 0;
+static ActivityTimer s_unacked_time;
 
 static void *__cdecl split_clc_delta(void *cl) {
     void *r = ((void *(__cdecl *)(void *))0x200F9900)(cl);
@@ -1143,17 +1468,14 @@ static int __cdecl split_usercmds_ready() {
     BYTE *cl = *(BYTE *volatile *)0x20B42B74;   // host_client
     if (!cl || !*(volatile int *)(cl + 12)) {   // !client->active
         s_snapshot_acked_spawn = -1;
-        s_active_seen_spawn = -1;
+        s_unacked_time.reset();
         return 0;
     }
+    if (chargen_holds_world()) return 0;
     int spawn = *(volatile int *)0x212AF1D0;    // svs.spawncount
     if (s_snapshot_acked_spawn == spawn) return 1;
-    DWORD now = GetTickCount();
-    if (s_active_seen_spawn != spawn) {
-        s_active_seen_spawn = spawn;
-        s_active_seen_tick = now ? now : 1;
-    } else if (now - s_active_seen_tick >= 5000) {
-        log("server: clc_delta timeout after 5 s (spawn %d); allowing usercmds", spawn);
+    if (s_unacked_time.packet(spawn, GetTickCount()) >= 5000) {
+        log("server: no acknowledged full update in 5 s of client packets (spawn %d); allowing usercmds", spawn);
         s_snapshot_acked_spawn = spawn;
         return 1;
     }
@@ -1256,6 +1578,8 @@ static int __cdecl split_start_sound(IRecipientFilter *filter, void *edict, int 
 // preload maps/<name>.bsp in parallel while the server loads the world.
 static int __cdecl server_spawn_notify(int maxclients) {
     reset_server_pause_state();
+    reset_npc_thinks();
+    s_chargen_hold = false;
     const char *name = (const char *)0x212B0768;
     size_t len = strnlen(name, 64);
     if (s_stdout && len > 0 && len < 64 && !strchr(name, ' ') && !strchr(name, '\n') && !strchr(name, '\r')) {
@@ -1301,6 +1625,8 @@ static int __cdecl server_filter_time(float dt) {
     int r = ((FilterTime_t)0x2008BA30)(dt);
     if (fps) *(float *)(fps + 0x28) = saved;
     if (r) {
+        // a world frame follows: sv.active, sv.paused
+        if (*(volatile int *)0x212B0754 && !*(volatile int *)0x212B0758 && world_should_run()) wake_visible_npcs();
         s_ran_frame = true;
         QueryPerformanceCounter(&s_last_frame_qpc);
     }
@@ -1411,9 +1737,9 @@ void on_engine_mapped(HMODULE engine) {
     // so an unknown engine.dll build fails cleanly without leaving engine.dll half-patched or launching a
     // second windowed game process.
     CodePatch gates[3] = {
-        make_gate_patch(engine, 0xF638B, 0xF6399, 0xF63A0, 0x07, "SV_Frame waits for a player"),
-        make_gate_patch(engine, 0xF51D6, 0xF51E4, 0xF51E8, 0x04, "SV_ActivateServer waits for a player"),
-        make_gate_patch(engine, 0xEDE2B, 0xEDE39, 0xEDE3F, 0x06, "server-running test waits for a player"),
+        make_gate_patch(engine, 0xF638B, 0xF6399, 0xF63A0, 0x07, (const void *)world_frame_should_run_saved, "SV_Frame waits for a player"),
+        make_gate_patch(engine, 0xF51D6, 0xF51E4, 0xF51E8, 0x04, (const void *)world_should_run_saved, "SV_ActivateServer waits for a player"),
+        make_gate_patch(engine, 0xEDE2B, 0xEDE39, 0xEDE3F, 0x06, (const void *)world_should_run_saved, "server-running test waits for a player"),
     };
     // "save" refuses unless the local client is in game (cmp cls.state,4; jnz refuse at 0x200958DE)
     // -> call world_should_run_saved; test eax,eax; jz refuse
@@ -1503,7 +1829,7 @@ void on_engine_mapped(HMODULE engine) {
             patch_matches(engine, usercmd_gate) &&
             (*clc_delta_slot == (void *)0x200F9900 || *clc_delta_slot == (void *)split_clc_delta)) {
             s_snapshot_acked_spawn = -1;
-            s_active_seen_spawn = -1;
+            s_unacked_time.reset();
             patch_vtable(clc_delta_slot, 0, (void *)split_clc_delta);
             if (*clc_delta_slot == (void *)split_clc_delta) {
                 apply_patch(engine, usercmd_gate);
@@ -1523,6 +1849,7 @@ void on_engine_mapped(HMODULE engine) {
     check_server_pause_addrs(engine);
     init_changelevel_guard(engine);
     install_message_box_guard();
+    install_display_settings_guard();
     static bool veh;
     if (!veh) veh = AddVectoredExceptionHandler(1, on_exception) != nullptr;
     log("server: engine.dll will run as a dedicated server");

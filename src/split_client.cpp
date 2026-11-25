@@ -8,6 +8,8 @@
 // arrives. Level changes happen on the server; when the server reports a new level the game reconnects if
 // it is not already on its way. If the server process cannot be started, the commands run locally as before.
 #include "common.h"
+#include "split_ironsights.h"
+#include "split_move_smooth.h"
 #include "split_player_interp.h"
 #include <atomic>
 #include <cmath>
@@ -178,6 +180,34 @@ static int __fastcall split_keyring_receive_message(void *self, void *, int size
         }
     }
     return s_keyring_recv_orig ? s_keyring_recv_orig(self, nullptr, size, data) : 0;
+}
+
+// Character Creation (CharEditPanel) is also a HUD element, and its Reset (client.dll+0x174690, vtable slot
+// client.dll+0x24B7C4) closes it, which on a new game's first map means "done": the game goes on to the opening
+// cutscene. The server sends "ResetHUD" with the player's first command. In single player that is always before
+// "createplayer" opens the screen; here the player's first command waits for the first snapshot
+// (split_usercmds_ready) while "createplayer" comes through the pipe, so the reset came second and closed the
+// screen 50 ms after it had opened. A reset that arrives on the map that opened the screen is no reason to close it.
+// Any other one is (another game was loaded over the open screen): s_chargen_map ends with the level.
+static bool s_chargen_map;                      // "createplayer" from the server has run on this level
+typedef char(__fastcall *PanelReset_t)(void *self, void *);
+static PanelReset_t s_chargen_reset_orig;
+static uintptr_t s_chargen_screen;              // client.dll's pointer to the one CharEditPanel
+static char __fastcall split_chargen_reset(void *self, void *) {
+    BYTE *screen = s_chargen_screen ? *(BYTE *volatile *)s_chargen_screen : nullptr;
+    if (s_chargen_map && screen && !*(volatile int *)kSvActive && *(const int *)(screen + 0x274) != 0) {
+        void *panel = screen + 0x10;   // the vgui panel: IsVisible
+        if (((char(__fastcall *)(void *, void *))(*(void ***)panel)[0x58 / 4])(panel, nullptr)) {
+            log("split: Character Creation stays open across the HUD reset");
+            return 0;
+        }
+    }
+    return s_chargen_reset_orig ? s_chargen_reset_orig(self, nullptr) : 0;
+}
+static bool is_createplayer(const std::string &cmd) {
+    static const char kName[] = "createplayer";
+    const size_t n = sizeof(kName) - 1;
+    return _strnicmp(cmd.c_str(), kName, n) == 0 && (cmd.size() == n || cmd[n] == ' ' || cmd[n] == ';' || cmd[n] == '"');
 }
 
 // The server's main loop sends "memx:alive" once a second (split_server.cpp). A server process that still
@@ -465,6 +495,7 @@ static void to_server(const std::string &line) {
 }
 
 static void forget_sent_settings();
+static void forget_ironsights_spread();
 static bool start_server() {
     s_sent_commands = false;
     s_sent_names = 0;
@@ -494,6 +525,7 @@ static bool start_server() {
     InterlockedExchange(&s_alive_seen, 0);
     InterlockedExchange(&s_server_loading, 0);
     s_load_failed_id.store(0, std::memory_order_release);
+    forget_ironsights_spread();
     char pipe_arg[64];
     char pipe_name[128];
     if (gen == 1) snprintf(pipe_arg, sizeof(pipe_arg), "%lu", GetCurrentProcessId());
@@ -672,11 +704,12 @@ static void connect_to_server() {
     clear_split_archive_flags();
     char cmd[256];
     int net_rate = g_settings.split_server_fps > 100 ? g_settings.split_server_fps : 100;
-    // Match client update/cmd rates to server_fps; cl_interp 0.025 (25 ms) gives ~3.6 snapshots at 144 Hz for
-    // zero-desync local-player interpolation; cl_cmdbackup 0 trims loopback overhead; cl_resend 0.25 avoids 6s stalls.
+    // Match the update rate to server_fps; cl_cmdrate 1000 sends every game frame's command in that frame (a lower
+    // rate holds some back, which the server then runs in one go); cl_interp 0.025 is what other entities use;
+    // cl_cmdbackup 0 trims loopback overhead; cl_resend 0.25 avoids 6s stalls.
     snprintf(cmd, sizeof(cmd),
-             "cl_updaterate %d\ncl_cmdrate %d\ncl_cmdbackup 0\ncl_interp 0.025\nrate 30000\ncl_resend 0.25\nconnect 127.0.0.1:%d\n",
-             net_rate, net_rate, s_port);
+             "cl_updaterate %d\ncl_cmdrate 1000\ncl_cmdbackup 0\ncl_interp 0.025\nrate 30000\ncl_resend 0.25\nconnect 127.0.0.1:%d\n",
+             net_rate, s_port);
     Cbuf_AddText(cmd);
 }
 
@@ -942,13 +975,15 @@ static void show_infobar_msg(const InfoBarMsg &m) {
 // CL_ClearState's memset begins at 0x203148A8, leaving cl.paused (0x20314874), v_pause_count (0x20B43788),
 // setpause_count (0x20B4378C), and v_paused_flag (0x20D63510) dirty when a save is loaded from a paused UI
 // screen or ESC menu. A stuck cl.paused=1 freezes client simulation/UI, and v_paused_flag=1 blocks every
-// gameplay keybinding in Key_Event while leaving the console openable.
+// gameplay keybinding in Key_Event while leaving the console openable. v_setpause also sets this process's own
+// sv.paused (0x212B0758); no server runs here, but it must not stay set either.
 static void reset_client_pause_state() {
     if (!s_pause_addrs_ok || *(volatile int *)kSvActive) return;
     *(volatile int *)0x20314874 = 0;   // cl.paused
     *(volatile int *)0x20B43788 = 0;   // v_pause_count
     *(volatile int *)0x20B4378C = 0;   // setpause_count
     *(volatile int *)0x20D63510 = 0;   // v_paused_flag
+    *(volatile int *)0x212B0758 = 0;   // sv.paused
 }
 
 // a level command for the server; "expects_level": the loading screen is up and waits for the level
@@ -1054,6 +1089,40 @@ static void split_v_unpause() {
     }
 }
 
+// ---- the iron sights plugin (split_ironsights.h) ----
+// Cmd_ExecuteString's Cmd_ForwardToServer (0x2002EB99 -> 0x2002EC20) for a command of vampire.dll: the iron
+// sights commands set a flag that this process's view reads, so they run here; the world never looks at it.
+static int __cdecl split_forward_to_server(char reliable) {
+    static const struct { const char *name; DWORD callback; } kCommands[] = {
+        {"+ironsights", kIronSightsOn}, {"-ironsights", kIronSightsOff}, {"ironsights", kIronSightsToggle}};
+    const char *name = Cmd_Argc() > 0 ? Cmd_Argv(0) : nullptr;
+    if (name) {
+        for (const auto &c : kCommands) {
+            if (_stricmp(name, c.name) != 0) continue;
+            if (BYTE *vampire = ironsights_vampire()) {
+                ((VoidFn_t)(vampire + c.callback))();
+                return 0;
+            }
+            break;
+        }
+    }
+    return ((int(__cdecl *)(char))0x2002EC20)(reliable);
+}
+
+// The spread multiplier the plugin's view worked out (1.0 without sights) is for the world's weapons.
+static DWORD s_iron_spread_sent = kIronSightsNoSpreadChange;   // what the server process has (a new one: 1.0)
+static void forget_ironsights_spread() { s_iron_spread_sent = kIronSightsNoSpreadChange; }
+static void sync_ironsights_spread() {
+    BYTE *vampire = ironsights_vampire();
+    if (!vampire) return;
+    DWORD spread = *(volatile DWORD *)(vampire + kIronSightsSpread);
+    if (spread == s_iron_spread_sent) return;
+    s_iron_spread_sent = spread;
+    char line[40];
+    snprintf(line, sizeof(line), "memx:ironspread %08lx", spread);
+    to_server(line);
+}
+
 // Console text that is no command goes to the game's Python (Cmd_ExecuteString -> 0x200DAB20). In single
 // player that Python is the one running the world; in a split game it is the server's.
 typedef int(__cdecl *PyConsole_t)(const char *);
@@ -1081,9 +1150,12 @@ static int __cdecl split_python(const char *text) {
 // (CL_ClearState, 0x20026570: the client's LevelShutdown follows) without a server of its own, the props
 // go first, while the client's leaf system still holds them, the order single player has.
 static void reset_npc_interp();
+static void reset_player_movement();
 static const uintptr_t kStaticProps = 0x2129EDC0;
 static void __cdecl split_clear_state() {
+    s_chargen_map = false;
     reset_npc_interp();
+    reset_player_movement();
     reset_client_pause_state();
     void **vt = *(void ***)kStaticProps;
     if (*(volatile int *)kClsState != 0 && !*(volatile int *)kSvActive && s_server && vt == (void **)0x2017549C &&
@@ -1180,7 +1252,11 @@ static int __cdecl client_filter_time(float dt) {
 //   - Detects every m_vecNetworkOrigin / m_angNetworkAngles change directly (even without m_flAnimTime changes).
 //   - Always starts each new segment from the previous frame's exact rendered position (zero forward teleport),
 //     carrying over remaining time and pacing multi-step bursts at the NPC's smoothed walk/run speed.
-//   - Snaps cleanly on first sight, EF_NOINTERP (0x800), PVS re-entry (>0.35 s unseen), or true teleports (>96 u).
+//   - Snaps cleanly on first sight, EF_NOINTERP (0x800), PVS re-entry (>0.35 s unseen), or true teleports (>96 u),
+//     and on the first large step after first sight (an NPC out of the player's PVS thinks once a second or less:
+//     what first arrives is where it was then, and its next think puts it where it belongs).
+//   - Takes as long as the NPC's own think interval when that is longer than the usual 0.1 s.
+// Limbs: see npc_cycle_interval below.
 struct NpcInterpSlot {
     const BYTE *ent;
     float last_net_org[3];
@@ -1193,6 +1269,12 @@ struct NpcInterpSlot {
     double end_time;
     double last_seen;
     float ema_speed;
+    double first_seen;
+    float last_anim;       // m_flAnimTime of the last update
+    float think_dt;        // time between the last two m_flAnimTime updates (0.1 until known)
+    float cycle_interval;  // what npc_cycle_interval last returned
+    int anim_updates;      // m_flAnimTime updates since first sight (stops at 2)
+    bool moved;            // its position has changed since first sight
 };
 static constexpr size_t kNpcInterpSlots = 512;
 static NpcInterpSlot s_npc_interp[kNpcInterpSlots];
@@ -1240,8 +1322,22 @@ static float __fastcall split_npc_interp_fraction(BYTE *ent) {
     double now = s_interp_clock;
 
     NpcInterpSlot *slot = find_npc_interp_slot(ent, now);
-    bool snap = (slot->ent != ent) || ((effects & 0x800u) != 0) ||
-                (now < slot->last_seen) || ((now - slot->last_seen) > 0.35);
+    bool fresh = (slot->ent != ent) || (now < slot->last_seen) || ((now - slot->last_seen) > 0.35);
+    bool snap = fresh || ((effects & 0x800u) != 0);
+    if (fresh) {
+        slot->first_seen = now;
+        slot->last_anim = cur_t;
+        slot->think_dt = 0.1f;
+        slot->cycle_interval = 0.0f;
+        slot->anim_updates = 0;
+        slot->moved = false;
+    } else if (cur_t != slot->last_anim) {
+        // the first interval may only be how the 8-bit m_flAnimTime of an old update was decoded
+        float dt = cur_t - slot->last_anim;
+        if (slot->anim_updates > 0 && dt > 0.02f && dt <= 1.25f) slot->think_dt = dt > 0.12f ? dt : 0.1f;
+        slot->last_anim = cur_t;
+        if (slot->anim_updates < 2) ++slot->anim_updates;
+    }
 
     if (!snap) {
         // Advance cur_org / cur_ang to exact interpolated position at `now`.
@@ -1272,9 +1368,14 @@ static float __fastcall split_npc_interp_fraction(BYTE *ent) {
             bool ang_changed = fabsf(wrap_angle_diff(slot->last_net_ang[0], net_ang[0])) > 0.05f ||
                                fabsf(wrap_angle_diff(slot->last_net_ang[1], net_ang[1])) > 0.05f ||
                                fabsf(wrap_angle_diff(slot->last_net_ang[2], net_ang[2])) > 0.05f;
-            if (org_changed || ang_changed) {
+            bool late_step = org_changed && !slot->moved && net_step_sq > 24.0f * 24.0f && now - slot->first_seen < 0.5;
+            if (org_changed) slot->moved = true;
+            if (late_step) {
+                snap = true;
+            } else if (org_changed || ang_changed) {
                 float anim_dt = cur_t - old_t;
-                float step_dt = (anim_dt >= 0.06f && anim_dt <= 0.25f) ? anim_dt : 0.10f;
+                float step_dt = (anim_dt >= 0.06f && anim_dt <= 0.25f) ? anim_dt
+                                : (anim_dt > 0.25f && slot->anim_updates >= 2) ? slot->think_dt : 0.10f;
                 float remaining = (slot->end_time > now) ? (float)(slot->end_time - now) : 0.0f;
                 if (remaining > 0.12f) remaining = 0.12f;
                 float dur = step_dt + remaining;
@@ -1333,9 +1434,263 @@ static float __fastcall split_npc_interp_fraction(BYTE *ent) {
     return f;
 }
 
-// C_BasePlayer::Interpolate (client.dll+0xA6B10), in place of its IsLocalPlayer() call: interpolate the local
-// player too, but only once it has the two position samples that takes (split_player_interp.h).
-static int __fastcall split_skip_player_interp(const BYTE *player) {
+// The limbs of the same NPCs. C_BaseAnimatingOverlay::StandardBlendingRules (client.dll+0x979B0) shows an NPC's
+// animation at m_flCycle plus 0.1 s times GetAnimTimeInterval(), a fraction 0..2 of one think: it is 0.1 s of
+// animation per update however long the update took, and it stops at 2. So the limbs froze (and then jumped)
+// whenever the next update took more than 0.2 s to arrive, or when the interval was wrong (the first update after
+// an NPC came into view), while the position above kept moving.
+// StudioFrameAdvance (vampire.dll+0x8F120) always leaves m_flCycle at the pose for m_flAnimTime, and a think sets
+// m_flAnimTime to 0.1 s after itself. The animation time that has passed since is therefore simply
+// cl.time - m_flAnimTime + 0.1, whatever the think interval: the game's own value for an NPC that thinks every
+// 0.1 s, and the same pose before and after every update. It runs on for one think interval plus 0.35 s.
+static bool player_cycle_interval(const BYTE *ent, float &t);
+static float __fastcall npc_cycle_interval(const BYTE *ent, void *, float fraction) {
+    float game = fraction * 0.1f;
+    if (!ent || *(volatile int *)kSvActive) return game;
+    float behind;
+    if (player_cycle_interval(ent, behind)) return game + behind;
+    size_t h = ((uintptr_t)ent >> 4) & (kNpcInterpSlots - 1);
+    NpcInterpSlot *slot = nullptr;
+    for (size_t i = 0; i < 8 && !slot; ++i) {
+        NpcInterpSlot *s = &s_npc_interp[(h + i) & (kNpcInterpSlots - 1)];
+        if (s->ent == ent) slot = s;
+    }
+    // only NPCs the interpolation above moved this moment; until one's m_flAnimTime has changed it may not be
+    // animating at all (a posed NPC that never thinks)
+    if (!slot || s_interp_clock < slot->last_seen || s_interp_clock - slot->last_seen > 0.35 || slot->anim_updates == 0)
+        return game;
+    if (*(volatile int *)0x20314874 && slot->cycle_interval != 0.0f) return slot->cycle_interval;   // cl.paused
+    float anim = *(const float *)(ent + 0x70);
+    float t = (float)(*(volatile double *)0x20314890 - (double)anim) + 0.1f;   // cl.time
+    if (!(anim > 0.0f) || !(t > -0.4f)) return game;
+    if (t < -0.15f) t = -0.15f;
+    float most = slot->think_dt + 0.35f;
+    if (t > most) t = most;
+    slot->cycle_interval = t;
+    return t;
+}
+// StandardBlendingRules, in place of "fmul 0.1" (client.dll+0x97A15): the fraction is in st(0), the entity in esi
+static __declspec(naked) void npc_cycle_interval_thunk() {
+    __asm {
+        push ecx
+        fstp dword ptr [esp]
+        mov ecx, esi
+        call npc_cycle_interval
+        ret
+    }
+}
+
+// ---- the local player's movement (split_move_smooth.h) ----
+static const uintptr_t kFrameTime = 0x20B42978;       // host_frametime (double)
+static const uintptr_t kClPaused = 0x20314874;        // cl.paused
+static const uintptr_t kClServerTime = 0x20314880;    // cl.mtime[0] (double): server time of the newest snapshot
+static const uintptr_t kClGameTime = 0x20314890;          // cl.time (double)
+static const uintptr_t kClOldTime = 0x20314898;       // cl.oldtime (double)
+static const uintptr_t kClCommandDrift = 0x203148A4;  // cl: what svc_time said about the player's commands (ms)
+static const uintptr_t kClClockDelta = 0x20346758;    // cl.time minus the last snapshot's time (double)
+static const uintptr_t kOutgoingSeq = 0x201DBE98;     // cls.netchan.outgoing_sequence: the next command's number
+static const uintptr_t kIncomingAck = 0x201DBE8C;     // cls.netchan.incoming_acknowledged
+static const uintptr_t kCmdBackup = 0x2019A8D8;       // CL_UPDATE_BACKUP: commands kept by CInput
+static MoveClock s_move_clock;
+static MoveTimeline s_move_line;
+static ClockFilter s_clock_filter;
+static bool s_move_engine_ok;                   // engine.dll's addresses above are the known ones
+static BYTE *s_move_client;                     // client.dll, its movement code being the known one
+static int s_drift_written;                     // what the last frame left in kClCommandDrift
+static double s_move_server_time;               // kClServerTime of the newest position taken
+static double s_move_dt;                        // this frame
+static bool s_move_looked;                      // this frame's position has been worked out ...
+static bool s_move_shown;                       // ... and the player put there
+static bool s_move_active;                      // ... by the code below, and not by the game's own
+static MovePose s_move_pose;
+static const BYTE *s_view_player;               // whose m_vecViewOffset holds s_move_pose.view instead of ...
+static float s_view_raw[3];                     // ... what the server sent
+
+static const BYTE *local_player() { return s_move_client ? *(const BYTE *volatile *)(s_move_client + 0x4A0D50) : nullptr; }
+
+static void reset_player_movement() {
+    s_move_clock.reset();
+    s_move_line.reset();
+    s_clock_filter.reset();
+    s_drift_written = 0;
+    s_move_server_time = 0.0;
+    s_move_looked = s_move_shown = s_move_active = false;
+    s_view_player = nullptr;
+}
+
+// Commands the game has made since the last look. CInput keeps the last kCmdBackup of them (96 bytes each;
+// +4 number, +0Ch milliseconds), by number.
+static void look_at_commands() {
+    const int newest = *(volatile int *)kOutgoingSeq - 1;
+    const int backup = *(volatile int *)kCmdBackup;
+    const BYTE *input = *(const BYTE *volatile *)(s_move_client + 0x27BA58);
+    const BYTE *cmds = input ? *(const BYTE *const *)(input + 0x1C0) : nullptr;
+    if (!cmds || (backup != 8 && backup != 64) || newest <= 0) {
+        s_move_clock.reset();
+        s_move_line.reset();
+        return;
+    }
+    if (s_move_clock.running && (newest < s_move_clock.last_seq || newest - s_move_clock.last_seq > backup / 2)) {
+        s_move_clock.reset();   // another connection, or no look for a while
+        s_move_line.reset();
+    }
+    if (!s_move_clock.running) {
+        s_move_clock.command(newest, -1);
+        return;
+    }
+    for (int seq = s_move_clock.last_seq + 1; seq <= newest; ++seq) {
+        const BYTE *cmd = cmds + 96 * (seq & (backup - 1));
+        s_move_clock.command(seq, *(const int *)(cmd + 4) == seq ? *(const int *)(cmd + 0xC) : -1);
+    }
+}
+
+// Start of a game frame, before it makes its command and reads the server's packets.
+static void player_movement_frame() {
+    s_move_looked = s_move_shown = false;
+    s_move_dt = 0.0;
+    if (s_view_player) {
+        if (s_view_player == local_player()) memcpy((BYTE *)s_view_player + 0x148, s_view_raw, sizeof(s_view_raw));
+        s_view_player = nullptr;
+    }
+    if (!s_move_client || *(volatile int *)kSvActive || *(volatile int *)kClsState != 4) {
+        if (s_move_clock.running) reset_player_movement();
+        s_move_active = false;
+        return;
+    }
+    look_at_commands();
+    if (!s_move_clock.running) return;
+    const double dt = *(volatile double *)kFrameTime;
+    int &drift = *(int *)kClCommandDrift;
+    const int reported = drift != s_drift_written ? drift : 0;
+    s_move_clock.advance(dt, reported, *(volatile int *)kClPaused != 0);
+    if (dt > 0.0) s_move_dt = dt;
+    drift = s_drift_written = s_move_clock.command_extra(dt);
+}
+
+static bool place_player(BYTE *player) {
+    s_move_active = false;
+    if (!s_move_clock.running || *(volatile int *)kSvActive || *(volatile int *)kClsState != 4) return false;
+    if (*(const DWORD *)(player + 0x208) != 0xFFFFFFFF) {   // attached to something: positions relative to it
+        s_move_line.restart();
+        s_move_server_time = 0.0;
+        return false;
+    }
+    if (!s_move_looked) {
+        s_move_looked = true;
+        look_at_commands();
+        MovePose now;
+        memcpy(now.org, player + 0x2B4, 12);
+        memcpy(now.ang, player + 0x2C0, 12);
+        memcpy(now.view, player + 0x148, 12);
+        const double server_time = *(volatile double *)kClServerTime;
+        double t;
+        if (server_time != s_move_server_time || s_move_line.count == 0) {
+            if (s_move_clock.stamp(*(volatile int *)kIncomingAck, t)) {
+                s_move_server_time = server_time;
+                s_move_line.add(t, now, (const float *)(player + 0xA8), (*(const DWORD *)(player + 0x74) & 0x800) != 0);
+            }
+        } else if (memcmp(now.org, s_move_line.history[s_move_line.count - 1].pose.org, 12) != 0) {
+            static const float kNoSpeed[3] = {};
+            s_move_line.add(s_move_line.history[s_move_line.count - 1].t, now, kNoSpeed, false);
+        }
+        if (!s_move_line.show(s_move_clock.wall, s_move_dt, *(volatile int *)kClPaused != 0, s_move_pose)) return false;
+        memcpy(s_view_raw, now.view, sizeof(s_view_raw));
+        s_view_player = player;
+        memcpy(player + 0x148, s_move_pose.view, sizeof(s_move_pose.view));
+        s_move_shown = true;
+    }
+    if (!s_move_shown) return false;
+    typedef void(__fastcall * SetAbs_t)(void *, void *, const float *);
+    ((SetAbs_t)(s_move_client + 0xA2100))(player, nullptr, s_move_pose.ang);   // SetAbsAngles
+    ((SetAbs_t)(s_move_client + 0xA2030))(player, nullptr, s_move_pose.org);   // SetAbsOrigin
+    s_move_active = true;
+    return true;
+}
+
+// The player's own animation: the server advances it with the player's commands, like the position.
+static bool player_cycle_interval(const BYTE *ent, float &t) {
+    if (!s_move_active || ent != local_player()) return false;
+    t = (float)s_move_line.shown_behind();
+    return true;
+}
+
+// Host_RunFrame's call to CL_AdjustClock (0x2008E721 -> 0x2002CC10)
+static void __cdecl split_adjust_clock() {
+    if (*(volatile int *)kSvActive || *(volatile int *)kClsState != 4 || *(volatile int *)kClPaused) {
+        s_clock_filter.reset();
+        ((VoidFn_t)0x2002CC10)();
+        return;
+    }
+    const double sample = *(volatile double *)kClClockDelta;
+    *(volatile double *)kClClockDelta = 0.0;   // used: the next snapshot writes the next one
+    const double off = s_clock_filter.correction(sample, *(volatile double *)kFrameTime);
+    if (off != 0.0) {
+        const double time = *(volatile double *)kClGameTime - off;
+        *(volatile double *)kClGameTime = time;
+        if (time < *(volatile double *)kClOldTime) *(volatile double *)kClOldTime = time;
+    }
+}
+
+struct KnownCode {
+    DWORD rva;
+    BYTE bytes[24];
+    int len;
+};
+static bool known_code(HMODULE mod, const KnownCode *list, size_t n) {
+    for (size_t i = 0; i < n; ++i)
+        if (!in_module_image(mod, list[i].rva, list[i].len) ||
+            memcmp((const BYTE *)mod + list[i].rva, list[i].bytes, list[i].len) != 0)
+            return false;
+    return true;
+}
+static bool movement_engine_ok(HMODULE engine) {
+    static const KnownCode kCode[] = {
+        {0x2CC10, {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x18, 0xDD, 0x05, 0x58, 0x67, 0x34, 0x20, 0x56}, 16},   // CL_AdjustClock
+        {0x2CE14, {0xA3, 0xA4, 0x48, 0x31, 0x20}, 5},                // svc_time writes the command drift
+        {0x2CE04, {0xDD, 0x1D, 0x80, 0x48, 0x31, 0x20}, 6},          // ... the server time
+        {0x2CE57, {0xDD, 0x05, 0x90, 0x48, 0x31, 0x20}, 6},          // ... reads cl.time
+        {0x2CEB3, {0x89, 0x0D, 0x58, 0x67, 0x34, 0x20}, 6},          // ... writes the clock delta
+        {0x27C8B, {0x8B, 0x35, 0xA4, 0x48, 0x31, 0x20, 0xDD, 0x05, 0x78, 0x29, 0xB4, 0x20}, 12},   // CL_Move: drift, frame time
+        {0x27CBA, {0xA1, 0x98, 0xBE, 0x1D, 0x20}, 5},                // ... outgoing_sequence
+        {0x2804D, {0x8B, 0x35, 0x8C, 0xBE, 0x1D, 0x20}, 6},          // incoming_acknowledged
+        {0x2B3A1, {0xA3, 0xD8, 0xA8, 0x19, 0x20}, 5},                // CL_UPDATE_BACKUP
+    };
+    return known_code(engine, kCode, sizeof(kCode) / sizeof(kCode[0]));
+}
+static bool movement_client_ok(HMODULE cl) {
+    static const KnownCode kCode[] = {
+        {0xA2030, {0x53, 0x56, 0x57, 0x8B, 0xF1, 0xE8, 0x66, 0xD8, 0xFF, 0xFF, 0x6A, 0x00, 0x68, 0x00, 0x08, 0x00, 0x00, 0x8B, 0xCE, 0xE8, 0x38, 0xC1, 0xFD, 0xFF}, 24},   // SetAbsOrigin
+        {0xA2100, {0x83, 0xEC, 0x60, 0x53, 0x55, 0x56, 0x57, 0x8B, 0xF1, 0xE8, 0x92, 0xD7, 0xFF, 0xFF, 0x68, 0x00, 0x30, 0x00, 0x00, 0x68, 0x00, 0x08, 0x00, 0x00}, 24},   // SetAbsAngles
+        {0x104440, {0x8B, 0x44, 0x24, 0x04, 0x8B, 0x91, 0xC0, 0x01, 0x00, 0x00, 0x8D, 0x04, 0x40, 0xC1, 0xE0, 0x05, 0x03, 0xC2, 0xC2, 0x04, 0x00}, 21},   // CInput::GetUserCmd
+        {0x10332B, {0x8B, 0xF9, 0x8B, 0x4C, 0x24, 0x5C, 0x89, 0x87, 0xC4, 0x01, 0x00, 0x00, 0x8B, 0x9F, 0xC0, 0x01, 0x00, 0x00}, 18},   // CInput::CreateMove: drift, commands
+        {0x1033BA, {0x89, 0x4E, 0x04}, 3},                           // ... number
+        {0x1033D3, {0x3B, 0xEB, 0x89, 0x46, 0x0C, 0x74, 0x42, 0x8B, 0x97, 0xC4, 0x01, 0x00, 0x00}, 13},   // ... milliseconds
+        {0x9F6E0, {0x8D, 0x81, 0xB4, 0x02, 0x00, 0x00, 0xC3}, 7},    // network origin
+        {0x9F6F0, {0x8D, 0x81, 0xC0, 0x02, 0x00, 0x00, 0xC3}, 7},    // network angles
+        {0x1912BA, {0xD8, 0x86, 0x48, 0x01, 0x00, 0x00}, 6},         // CalcView: m_vecViewOffset
+        {0xA48C4, {0x68, 0x48, 0x01, 0x00, 0x00}, 5},                // received m_vecViewOffset
+        {0xA50DA, {0x68, 0xA8, 0x00, 0x00, 0x00}, 5},                // received m_vecVelocity
+        {0x9D946, {0x6A, 0x74}, 2},                                  // received m_fEffects
+        {0xA2091 - 6, {0x8B, 0x86, 0x08, 0x02, 0x00, 0x00}, 6},      // the entity it is attached to
+    };
+    if (!known_code(cl, kCode, sizeof(kCode) / sizeof(kCode[0]))) return false;
+    // mov ecx, [the game's CInput]; mov eax/ecx, [the local player]
+    BYTE input[6] = {0x8B, 0x0D};
+    DWORD var = (DWORD)((uintptr_t)cl + 0x27BA58);
+    memcpy(input + 2, &var, 4);
+    BYTE player[7] = {0xA1, 0, 0, 0, 0, 0x85, 0xC0};
+    var = (DWORD)((uintptr_t)cl + 0x4A0D50);
+    memcpy(player + 1, &var, 4);
+    return in_module_image(cl, 0xCBBE9, 6) && memcmp((const BYTE *)cl + 0xCBBE9, input, 6) == 0 &&
+           in_module_image(cl, 0x173385, 7) && memcmp((const BYTE *)cl + 0x173385, player, 7) == 0;
+}
+
+// C_BasePlayer::Interpolate (client.dll+0xA6B10), in place of its IsLocalPlayer() call: 1 = the player is in place,
+// 0 = interpolate. The local player goes where the code above says. Until that has what it needs (the first frames
+// of a level), and while the player is attached to something, the game's own interpolation does it, but only once
+// it has the two position samples that takes (split_player_interp.h).
+static int __fastcall split_skip_player_interp(BYTE *player) {
+    if (player && s_move_client && player == local_player() && place_player(player)) return 1;
     return player_interp_ready(player) ? 0 : 1;
 }
 
@@ -1379,12 +1734,14 @@ static void __cdecl client_frame() {
     } else {
         s_interp_last_dt = 0.0;
     }
+    bool ran_createplayer = false;
+    player_movement_frame();
     tune_engine_sockets();
     if (s_server) {
         uint32_t work = s_pending_work.load(std::memory_order_acquire);
         bool can_run_cmds = (*(volatile int *)kClsState == 4) && local_player_ready();
-        bool can_show_infobar = (*(volatile int *)kClsState >= 3);
-        uint32_t drain_mask = 5u | (can_run_cmds ? 2u : 0u) | (can_show_infobar ? 16u : 0u);
+        // A notice waits for the game screen too: its few seconds would pass unseen under the loading screen.
+        uint32_t drain_mask = 5u | (can_run_cmds ? 18u : 0u);
         if (work & drain_mask) {
             std::vector<std::string> lines, cmds;
             std::vector<InfoBarMsg> infobars;
@@ -1393,7 +1750,7 @@ static void __cdecl client_frame() {
             EnterCriticalSection(&s_cs);
             lines.swap(s_to_console);
             if (can_run_cmds) cmds.swap(s_from_server);
-            if (can_show_infobar) infobars.swap(s_infobar_msgs);
+            if (can_run_cmds) infobars.swap(s_infobar_msgs);
             save_client.swap(s_save_client_req);
             save_id = s_save_client_id;
             s_pending_work.fetch_and(~drain_mask, std::memory_order_release);
@@ -1415,6 +1772,7 @@ static void __cdecl client_frame() {
             for (const std::string &l : lines) Con_Printf("%s", l.c_str());
             for (const std::string &c : cmds) {
                 if (g_settings.verbose) log("split: from the server: %s", c.c_str());
+                if (is_createplayer(c)) ran_createplayer = s_chargen_map = true;
                 Cbuf_AddText((c + "\n").c_str());
             }
         }
@@ -1508,6 +1866,7 @@ static void __cdecl client_frame() {
                 }
             }
         }
+        if (s_want_game && can_run_cmds && !*(volatile int *)kSvActive) sync_ironsights_spread();
         LONG spawns = s_server_spawns;
         if (s_want_game && spawns != s_spawns_seen) {
             // the server has a new level: connect immediately (or wake a pending cl_resend right now)
@@ -1573,9 +1932,9 @@ static void __cdecl client_frame() {
     // Enable zero-desync local-player interpolation in split mode (once per loaded client.dll).
     // Vanilla VTMB runs cl_predict 0 because client.dll's CGameMovement lacks Troika's VTMB extensions
     // (causing +/-0.15..0.43 unit per-tick prediction errors and visible A/D strafing jitter with cl_predict 1).
-    // Replacing the IsLocalPlayer() early-out in C_BasePlayer::Interpolate (call at client+0xA6B16) with
-    // cl_interp 0.025 smoothly interpolates authoritative 144 Hz server snapshots at full render FPS
-    // with zero prediction snaps and zero cl_predictweapons side effects (mouse look stays 0 ms direct).
+    // Replacing the IsLocalPlayer() early-out in C_BasePlayer::Interpolate (call at client+0xA6B16) lets
+    // split_skip_player_interp show the authoritative server snapshots at full render FPS with zero prediction
+    // snaps and zero cl_predictweapons side effects (mouse look stays 0 ms direct).
     // The early-out must stay for a player without position samples (just created: a level's first frames,
     // any full update). Versions up to 1.1.1 removed it altogether: the player was then put at whatever was
     // on the stack, weapons that follow it took that over, and two of them at NaN positions filled the
@@ -1584,6 +1943,8 @@ static void __cdecl client_frame() {
         HMODULE cl = GetModuleHandleW(L"client.dll");
         if (cl && cl != s_interp_client) {
             s_interp_client = cl;
+            s_move_client = nullptr;
+            reset_player_movement();
             // call IsLocalPlayer; test al, al; jnz +5Bh: the call alone is redirected
             CodePatch local_interp = {
                 0xA6B16,
@@ -1594,9 +1955,14 @@ static void __cdecl client_frame() {
             DWORD local_rel = (DWORD)((uintptr_t)&split_skip_player_interp - ((uintptr_t)cl + 0xA6B16 + 5));
             memcpy(local_interp.repl + 1, &local_rel, 4);
             if (in_module_image(cl, 0xA6970, 0x200) && in_module_image(cl, 0xA1EF0, 0x100) &&
-                player_history_code_ok_at((const unsigned char *)cl))
-                apply_patch(cl, local_interp);
-            else log("not patched (unknown bytes): split: smooth local-player interpolation");
+                player_history_code_ok_at((const unsigned char *)cl)) {
+                if (apply_patch(cl, local_interp)) {
+                    if (s_move_engine_ok && movement_client_ok(cl)) {
+                        s_move_client = (BYTE *)cl;
+                        log("split: the player moves in command time");
+                    } else log("not patched (unknown bytes): split: player movement in command time");
+                }
+            } else log("not patched (unknown bytes): split: smooth local-player interpolation");
             // C_BaseAnimating::Interpolate (MOVETYPE_STEP NPCs): replace call [edx+0x1E8] at client+0x94F62
             // (6 bytes: FF 92 E8 01 00 00) with call split_npc_interp_fraction; nop.
             CodePatch npc_interp = {
@@ -1607,7 +1973,22 @@ static void __cdecl client_frame() {
                 "split: zero-extrapolation NPC interpolation"};
             DWORD rel = (DWORD)((uintptr_t)&split_npc_interp_fraction - ((uintptr_t)cl + 0x94F62 + 5));
             memcpy(npc_interp.repl + 1, &rel, 4);
-            apply_patch(cl, npc_interp);
+            bool npc_interp_ok = apply_patch(cl, npc_interp);
+            // StandardBlendingRules: fld [esp+18h]; fmul [client+0x224050] (0.1); mov ecx,[esi+640h]
+            CodePatch npc_cycle = {
+                0x97A11,
+                {0xD9, 0x44, 0x24, 0x18, 0xDC, 0x0D, 0, 0, 0, 0, 0x8B, 0x8E, 0x40, 0x06, 0x00, 0x00},
+                {0xD9, 0x44, 0x24, 0x18, 0xE8, 0, 0, 0, 0, 0x90, 0x8B, 0x8E, 0x40, 0x06, 0x00, 0x00},
+                16,
+                "split: NPC animation between updates"};
+            DWORD tenth = (DWORD)((uintptr_t)cl + 0x224050);
+            DWORD cycle_rel = (DWORD)((uintptr_t)&npc_cycle_interval_thunk - ((uintptr_t)cl + 0x97A15 + 5));
+            memcpy(npc_cycle.expect + 6, &tenth, 4);
+            memcpy(npc_cycle.repl + 5, &cycle_rel, 4);
+            // CEngineClient::GetClientTime's "fld cl.time" (the clock the game's own fraction uses)
+            static const BYTE kClTime[] = {0xDD, 0x05, 0x90, 0x48, 0x31, 0x20};
+            if (npc_interp_ok && memcmp((const void *)0x2001A6B1, kClTime, sizeof(kClTime)) == 0) apply_patch(cl, npc_cycle);
+            else log("not patched (unknown bytes): %s", npc_cycle.what);
             // C_ItemGKeyring::ReceiveMessage bounds guard (vtable slot client+0x1E4488 -> client+0x37F0).
             static const BYTE kKeyringHead[] = {0x8B, 0x44, 0x24, 0x04, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00, 0x56, 0x8B, 0xF1, 0x8B, 0x8C, 0x24};
             static const BYTE kKeyringRem[] = {0x3C, 0x7B, 0x75, 0x40, 0xE8, 0xC1, 0x0D, 0x11, 0x00, 0x8B, 0x8E, 0x7C, 0x09, 0x00, 0x00, 0x2B};
@@ -1625,9 +2006,34 @@ static void __cdecl client_frame() {
             } else {
                 log("not patched (unknown bytes): split: keyring ReceiveMessage guard");
             }
+            // CharEditPanel::Reset: mov ecx,[panel]; test ecx,ecx; jz; push 0; call close; ret
+            BYTE reset_code[] = {0x8B, 0x0D, 0, 0, 0, 0, 0x85, 0xC9, 0x74, 0x07, 0x6A, 0x00, 0xE8, 0x2F, 0xED, 0xFF, 0xFF, 0xC3};
+            DWORD panel_var = (DWORD)((uintptr_t)cl + 0x5FB14C);
+            memcpy(reset_code + 2, &panel_var, 4);
+            // ... and the close it calls (past its prologue, which other plugins may hook):
+            // creation mode (+274h) and the vgui panel (+10h, IsVisible at +58h)
+            static const BYTE kCloseBody[] = {
+                0x8B, 0x86, 0x74, 0x02, 0x00, 0x00, 0xC6, 0x86, 0xF9, 0x0C, 0x00, 0x00, 0x01,
+                0x85, 0xC0, 0x0F, 0x84, 0x88, 0x00, 0x00, 0x00,
+                0x8B, 0x46, 0x10, 0x8D, 0x7E, 0x10, 0x8B, 0xCF, 0xC6, 0x86, 0xD8, 0x0E, 0x00, 0x00, 0x00, 0xFF, 0x50, 0x58};
+            void **reset_slot = (void **)((BYTE *)cl + 0x24B7C4);
+            void *reset_fn = (BYTE *)cl + 0x174690;
+            if (in_module_image(cl, 0x174690, sizeof(reset_code)) && in_module_image(cl, 0x1733DE, sizeof(kCloseBody)) &&
+                in_module_image(cl, 0x24B7C4, sizeof(void *)) && memcmp(reset_fn, reset_code, sizeof(reset_code)) == 0 &&
+                memcmp((BYTE *)cl + 0x1733DE, kCloseBody, sizeof(kCloseBody)) == 0 &&
+                (*reset_slot == reset_fn || *reset_slot == (void *)split_chargen_reset)) {
+                s_chargen_screen = panel_var;
+                s_chargen_reset_orig = (PanelReset_t)reset_fn;
+                patch_vtable(reset_slot, 0, (void *)split_chargen_reset);
+                if (g_settings.verbose) log("split: Character Creation guard active");
+            } else {
+                log("not patched (unknown bytes): split: Character Creation guard");
+            }
         }
     }
     Cbuf_Execute();
+    // Character Creation is up (and its pause has gone ahead of this line): the world may go on, paused.
+    if (ran_createplayer) to_server("memx:cmddone");
 }
 
 static volatile bool s_installed;   // this process plays on a server process (the commands above are redirected)
@@ -1720,6 +2126,8 @@ void install_split_client(HMODULE engine) {
     s_sent_cmd_head = nullptr;
     s_sent_cmd_set.clear();
     s_interp_client = nullptr;
+    s_move_client = nullptr;
+    reset_player_movement();
     s_checked_cl = nullptr;
     s_offset_ok = false;
     s_frame_seen = false;
@@ -1768,6 +2176,9 @@ void install_split_client(HMODULE engine) {
                            memcmp((const BYTE *)engine + 0x918BB, kVPauseFlag, sizeof(kVPauseFlag)) == 0 &&
                            memcmp((const BYTE *)engine + 0x9199B, kSetPauseCount, sizeof(kSetPauseCount)) == 0;
     }
+    s_move_engine_ok = movement_engine_ok(engine);
+    if (s_move_engine_ok) redirect_call(engine, 0x8E721, 0x2CC10, (void *)split_adjust_clock, "split: steady client clock");
+    else log("not patched (unknown bytes): split: steady client clock");
     if (!s_loading_screen) log("split: loading screen not shown (unknown engine code)");
     static const BYTE kFpsMaxRead[] = {0x8B, 0x0D, 0x84, 0x28, 0xB4, 0x20, 0x8B, 0x51, 0x28};
     if (in_module_image(engine, 0x8BA5F, sizeof(kFpsMaxRead)) &&
@@ -1778,6 +2189,7 @@ void install_split_client(HMODULE engine) {
         memcmp((BYTE *)engine + 0x4A7B9, kDecalCountRead, sizeof(kDecalCountRead)) == 0)
         redirect_call(engine, 0x968D9, 0xF8870, (void *)split_restore_precache_decal, "split: restore map decals");
     redirect_call(engine, 0x2EC13, 0xDAB20, (void *)split_python, "split: console Python to the server");
+    redirect_call(engine, 0x2EB99, 0x2EC20, (void *)split_forward_to_server, "split: iron sights commands in this process");
     // CL_ClearState's three callers (CL_Disconnect, CL_ParseServerInfo, Host_Disconnect's helper)
     redirect_call(engine, 0x26879, 0x26570, (void *)split_clear_state, "split: static props released (disconnect)");
     redirect_call(engine, 0x2B263, 0x26570, (void *)split_clear_state, "split: static props released (new level)");

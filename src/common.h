@@ -48,6 +48,16 @@ bool in_module_image(HMODULE mod, DWORD rva, DWORD len);
 // ---- diagnostics (alloc_trace.cpp) ----
 void describe_address(void *addr, char *out, size_t n);          // "module.dll+rva" or the raw address
 int scan_stack(void **sp, char *out, size_t n, int max);        // likely return addresses on a stack
+// Where another thread of this process is. Taking a sample suspends the thread for a moment; describing it
+// afterwards takes no loader lock, so it works on a thread that is stuck holding one.
+struct ThreadSample {
+    void *ip;
+    int words;
+    void *stack[16384];             // copy of its stack from the top
+};
+bool sample_thread(HANDLE thread, void *stack_base, ThreadSample &s);
+void describe_mapped(void *addr, char *out, size_t n);           // describe_address without the loader lock
+int scan_words(void *const *words, int count, char *out, size_t n, int max);   // scan_stack for a copied stack
 
 // ---- process split (split_server.cpp) ----
 bool server_mode();                  // this process was started as the game's server (-memx_server)
