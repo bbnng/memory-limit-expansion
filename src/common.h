@@ -28,6 +28,8 @@ extern wchar_t g_dir[MAX_PATH];     // folder of the .vtm, with trailing backsla
 
 void log(const char *fmt, ...);
 void load_settings();
+// Renames an existing log at path to prev (replacing an older prev) so a new run does not overwrite it.
+void keep_previous_log(const wchar_t *path, const wchar_t *prev);
 
 // ---- address-space and memory figures ----
 struct VaStats {

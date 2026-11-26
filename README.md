@@ -90,7 +90,16 @@ Known limitations of the experimental split mode:
 `memory_expansion.log` (written next to `memory_expansion.ini`) records periodic address-space
 statistics (`[Diagnostics] stats_seconds`, default 60). Setting `trace_allocs_mb` logs every large
 allocation above that threshold along with its call site, and `console_log = 1` mirrors the game's
-console output to `game_console.log` (the split server process always writes `server_console.log`).
+console output to `game_console.log` (the split server process always writes `server_console.log`
+and `memory_expansion_server.log`).
+
+Each log is started fresh when its process starts; the previous run's log is kept as
+`<name>.prev.log` (for example `memory_expansion_server.prev.log`), so a server process that was
+ended and replaced still leaves its last lines behind. The server log notes how long every save
+took and, when the world stops, where its main thread was every 5 seconds. If the game has to end
+a server process that stopped responding, it first writes `memory_expansion_server_hang.dmp` (the
+server's threads at that moment) next to the logs. Attach the logs, their `.prev.log` copies and
+the `.dmp` file to a bug report.
 
 ## DXVK compatibility
 

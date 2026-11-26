@@ -173,6 +173,17 @@ static void *s_main_stack_base;
 static const DWORD kStallSampleMs = 5000;
 static const DWORD kStallSamples = 4;       // per stall
 
+// A save (the save command, an autosave) runs in one world frame: the world's state, the game's client state
+// (save_client_state_split), then every level state of the game folder's SAVE folder compressed into the .sav.
+// A late game's save can take longer than the game waits for "memx:alive" (split_client.cpp). While the main
+// thread is in a save and still uses the CPU, the watch thread sends "memx:alive" for it, so a save that works
+// is never ended; a save whose thread stopped (waits on something) still is.
+static volatile LONG s_in_save;             // the main thread is in CSaveRestore::SaveGameSlot
+static const DWORD kSaveBusyCpuMs = 100;    // CPU the main thread used in the last second: the save goes on
+static const DWORD kSaveMaxMs = 40000;      // vouch for a busy save up to 40 s (+20 s watchdog = ~60 s max)
+static const char kStepSaveWorld[] = "a save: the world's state";
+static const char kStepSaveFile[] = "a save: the .sav file (after the game's client state)";
+
 // A stack overflow leaves its thread too little stack to log it: it hands that to the watch thread.
 static HANDLE s_overflow_event, s_overflow_logged;
 static void *volatile s_overflow_ip;
@@ -211,6 +222,7 @@ static DWORD WINAPI loop_watch_thread(void *) {
     DWORD reported = 0;
     DWORD samples = 0;
     DWORD broken_since = 0;
+    bool vouched = false;   // this stall is a save the watch thread sends "memx:alive" for
     DWORD cpu_tick = GetTickCount();
     ULONGLONG cpu = thread_cpu_ms(s_main_thread);
     for (;;) {
@@ -233,11 +245,23 @@ static DWORD WINAPI loop_watch_thread(void *) {
         DWORD now = GetTickCount();
         DWORD stalled = (int)(now - tick) > 0 ? (now - tick) : 0;
         ULONGLONG cpu_now = thread_cpu_ms(s_main_thread);
+        const DWORD busy = cpu_now >= cpu ? (DWORD)(cpu_now - cpu) : 0;
         if (stalled < kStallSampleMs) {
             samples = 0;
         } else if (samples < kStallSamples && stalled >= kStallSampleMs * (samples + 1)) {
             samples = stalled / kStallSampleMs;
-            log_main_thread(stalled, (DWORD)(cpu_now - cpu), now - cpu_tick);
+            log_main_thread(stalled, busy, now - cpu_tick);
+        }
+        // a save that is still working: keep the game from ending this process
+        if (stalled >= 2000 && s_in_save && stalled < kSaveMaxMs && busy >= kSaveBusyCpuMs && s_stdout && !s_stdout_broken) {
+            if (!vouched) {
+                vouched = true;
+                log("server: a save has run %lu s and still works (%lu ms of CPU in the last %lu ms); the game waits for it",
+                    stalled / 1000, busy, now - cpu_tick);
+            }
+            status_write("memx:alive\n");
+        } else if (stalled < 2000) {
+            vouched = false;
         }
         cpu = cpu_now;
         cpu_tick = now;
@@ -833,6 +857,7 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
         tune_engine_sockets();
         s_loop_step = "a world frame (RunFrame)";
         if (!hlds->RunFrame()) break;
+        if (s_in_save) InterlockedExchange(&s_in_save, 0);   // in case Host_Error longjmp unwound out of SaveGameSlot
         s_loop_step = "after the world frame";
         // a new level is up (svs.spawncount 0x212AF1D0 changes with every SV_SpawnServer; sv.active 0x212B0754):
         // tell the game, which connects to it
@@ -1224,9 +1249,13 @@ static void write_console_file(const char *data, size_t n) {
     AcquireSRWLockExclusive(&s_file_lock);
     if (!s_console_tried) {
         s_console_tried = true;
-        wchar_t path[MAX_PATH + 64];
-        _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s%s", g_dir, server_mode() ? L"server_console.log" : L"game_console.log");
-        s_console_file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, 0, nullptr);
+        wchar_t path[MAX_PATH + 64], prev[MAX_PATH + 64];
+        const wchar_t *name = server_mode() ? L"server_console" : L"game_console";
+        _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s%s.log", g_dir, name);
+        _snwprintf_s(prev, _countof(prev), _TRUNCATE, L"%s%s.prev.log", g_dir, name);
+        keep_previous_log(path, prev);
+        s_console_file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                     CREATE_ALWAYS, 0, nullptr);
     }
     if (s_console_file != INVALID_HANDLE_VALUE) WriteFile(s_console_file, data, (DWORD)n, &done, nullptr);
     ReleaseSRWLockExclusive(&s_file_lock);
@@ -1643,15 +1672,25 @@ static bool __fastcall engine_client_world_ready(void *) { return world_should_r
 // the game process to write the real .HL2 file and wait briefly for its "memx:saveclient_done" ack on the
 // pipe thread. RestoreClientState stays a no-op here; the server sends svc_restore and the game runs it.
 static int __fastcall save_client_state_split(void *, void *, const char *fileName) {
-    if (!s_stdout || !s_saveclient_done || !fileName || !*fileName || !world_should_run()) return 1;
-    if (strchr(fileName, '\n') || strchr(fileName, '\r') || strlen(fileName) > 400) return 1;
+    // in a save, what follows is the .sav file; in a level change, the caller's step goes on
+    const char *step = s_in_save ? kStepSaveFile : s_loop_step;
+    if (!s_stdout || !s_saveclient_done || !fileName || !*fileName || !world_should_run()) {
+        s_loop_step = step;
+        return 1;
+    }
+    if (strchr(fileName, '\n') || strchr(fileName, '\r') || strlen(fileName) > 400) {
+        s_loop_step = step;
+        return 1;
+    }
     LONG id = InterlockedIncrement(&s_saveclient_seq);
     InterlockedExchange(&s_saveclient_ok, 0);
     ResetEvent(s_saveclient_done);
     char line[512];
     snprintf(line, sizeof(line), "memx:saveclient %ld %s\n", (long)id, fileName);
-    if (!status_write(line)) return 1;
-    const char *step = s_loop_step;
+    if (!status_write(line)) {
+        s_loop_step = step;
+        return 1;
+    }
     s_loop_step = "a save: waiting for the game's client state";
     DWORD w = WaitForSingleObject(s_saveclient_done, 2500);
     s_loop_step = step;
@@ -1660,6 +1699,32 @@ static int __fastcall save_client_state_split(void *, void *, const char *fileNa
         log("server: client state %s (id=%ld %s)",
             w != WAIT_OBJECT_0 ? "save timed out" : (ok ? "saved" : "not written by client"), (long)id, fileName);
     return 1;
+}
+
+// CSaveRestore::SaveGameSlot (vtable slot 12, engine.dll 0x20095980): the save command (Host_Savegame_f) and the
+// autosave call it through the vtable. BLSE hooks the function's code, not this slot, so its save events still
+// run inside. Marks the main loop's step (the stall log names the part of the save) and logs how long each save
+// took; the watch thread keeps a save that still works alive for the game (loop_watch_thread).
+typedef int(__fastcall *SaveGameSlot_t)(void *self, void *, const char *name, const char *comment, const char *extra);
+static SaveGameSlot_t s_save_game_slot;   // the engine's (0x20095980)
+static int __fastcall save_game_slot_split(void *self, void *, const char *name, const char *comment, const char *extra) {
+    if (!s_save_game_slot) return 0;
+    const char *step = s_loop_step;
+    char shown[64] = "?";
+    if (name) {
+        size_t n = 0;
+        for (const char *p = name; *p && n < sizeof(shown) - 1; ++p) shown[n++] = (*p == '\r' || *p == '\n') ? ' ' : *p;
+        shown[n] = '\0';
+    }
+    s_loop_step = kStepSaveWorld;
+    InterlockedExchange(&s_in_save, 1);
+    DWORD begin = GetTickCount();
+    int ok = s_save_game_slot(self, nullptr, name, comment, extra);
+    DWORD took = GetTickCount() - begin;
+    InterlockedExchange(&s_in_save, 0);
+    s_loop_step = step;
+    log("server: save %s %s in %lu ms", shown, ok ? "written" : "not written", took);
+    return ok;
 }
 static int __fastcall restore_client_state_none(void *, void *, int, int) { return 1; }     // slot 17
 
@@ -1768,6 +1833,9 @@ void on_engine_mapped(HMODULE engine) {
         log("server: fatal: not patched (unknown vtable): save client state; exiting server process");
         ExitProcess(1);
     }
+    // optional: the save's steps in the stall log and its time (another owner of the slot keeps it)
+    const bool save_slot_ok = vt_sr[12] == (void *)0x20095980 || vt_sr[12] == (void *)save_game_slot_split;
+    if (!save_slot_ok) log("server: not patched (unknown vtable entry): save timing and steps");
 
     // Hook CreateInterface first: if the export table cannot be patched, exit cleanly instead of opening a game window.
     void *old = nullptr;
@@ -1783,6 +1851,10 @@ void on_engine_mapped(HMODULE engine) {
     patch_vtable(vt_eng, 3, (void *)engine_client_world_ready);
     patch_vtable(vt_sr, 14, (void *)save_client_state_split);
     patch_vtable(vt_sr, 17, (void *)restore_client_state_none);
+    if (save_slot_ok) {
+        s_save_game_slot = (SaveGameSlot_t)0x20095980;
+        patch_vtable(vt_sr, 12, (void *)save_game_slot_split);
+    }
 
     // Optional smoothness / gameplay / fast-load patches (a failed check only logs).
     for (const CodePatch &p : kSmoothPatches) apply_patch(engine, p);

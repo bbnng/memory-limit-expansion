@@ -241,11 +241,58 @@ static DWORD server_stuck_limit_ms() {
     return s_server_loading ? kStuckLoadingMs : kStuckInGameMs;
 }
 
+// Before a stuck server process is ended, its threads (stacks, the handles they wait on) are written to
+// memory_expansion_server_hang.dmp next to the .vtm: where its main loop stopped can be read afterwards, also
+// when the stall samples of memory_expansion_server.log do not settle it. One file, the newest stall.
+static void dump_stuck_server(HANDLE srv) {
+    typedef BOOL(WINAPI * MiniDumpWriteDump_t)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+    static HMODULE dbghelp;
+    if (!dbghelp) {
+        dbghelp = LoadLibraryExW(L"dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!dbghelp) {
+            wchar_t sys[MAX_PATH + 16];
+            UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+            if (n && n < MAX_PATH) {
+                wcscat_s(sys, L"\\dbghelp.dll");
+                dbghelp = LoadLibraryW(sys);
+            }
+        }
+    }
+    auto write_dump = dbghelp ? (MiniDumpWriteDump_t)GetProcAddress(dbghelp, "MiniDumpWriteDump") : nullptr;
+    if (!write_dump) {
+        log("split: no hang dump of the server process (dbghelp.dll unavailable)");
+        return;
+    }
+    wchar_t path[MAX_PATH + 64];
+    _snwprintf_s(path, _countof(path), _TRUNCATE, L"%smemory_expansion_server_hang.dmp", g_dir);
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        log("split: no hang dump of the server process (cannot create the file, error %lu)", GetLastError());
+        return;
+    }
+    // MiniDumpNormal | WithHandleData | WithUnloadedModules | WithIndirectlyReferencedMemory | WithThreadInfo
+    const int type = 0x0000 | 0x0004 | 0x0020 | 0x0040 | 0x1000;
+    DWORD begin = GetTickCount();
+    BOOL ok = write_dump(srv, GetProcessId(srv), file, type, nullptr, nullptr, nullptr);
+    DWORD error = ok ? 0 : GetLastError();
+    LARGE_INTEGER size = {};
+    GetFileSizeEx(file, &size);
+    CloseHandle(file);
+    if (ok) {
+        log("split: wrote memory_expansion_server_hang.dmp (%lld KB in %lu ms): the server process's threads when it was ended",
+            size.QuadPart >> 10, GetTickCount() - begin);
+    } else {
+        DeleteFileW(path);
+        log("split: no hang dump of the server process (MiniDumpWriteDump error %lu)", error);
+    }
+}
+
 // Ends a server process whose main loop stopped; the next New Game or Load starts a new one.
 static void end_stuck_server(DWORD quiet) {
     HANDLE srv = s_server;
     if (!srv) return;
     log("split: the server process has not run its main loop for %lu s; ending it", quiet / 1000);
+    if (WaitForSingleObject(srv, 0) == WAIT_TIMEOUT) dump_stuck_server(srv);
     Con_Printf("Memory Expansion: the server process stopped responding (%lu s) and was ended. Load a save or start a new game.\n",
                quiet / 1000);
     InterlockedExchange(&s_alive_seen, 0);

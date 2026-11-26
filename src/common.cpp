@@ -9,12 +9,25 @@ wchar_t g_dir[MAX_PATH];
 static CRITICAL_SECTION g_log_lock;
 static HANDLE g_log_file = INVALID_HANDLE_VALUE;
 
+// Keeps the previous run's log as <name>.prev.log before a new one is started: a server process the game ended
+// (stuck or crashed) is replaced by a new one at the next load, and without this its last lines (the stall
+// samples) would be gone.
+void keep_previous_log(const wchar_t *path, const wchar_t *prev) {
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return;
+    MoveFileExW(path, prev, MOVEFILE_REPLACE_EXISTING);
+}
+
 static void log_open() {
     InitializeCriticalSection(&g_log_lock);
-    wchar_t path[MAX_PATH + 64];
+    wchar_t path[MAX_PATH + 64], prev[MAX_PATH + 64];
     // the server process (process split) runs from the same folder and keeps its own log
-    _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s%s", g_dir, server_mode() ? L"memory_expansion_server.log" : L"memory_expansion.log");
-    g_log_file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const wchar_t *name = server_mode() ? L"memory_expansion_server" : L"memory_expansion";
+    _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s%s.log", g_dir, name);
+    _snwprintf_s(prev, _countof(prev), _TRUNCATE, L"%s%s.prev.log", g_dir, name);
+    keep_previous_log(path, prev);
+    // FILE_SHARE_DELETE: the next process can keep this log even while this one still has it open
+    g_log_file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 
 void log(const char *fmt, ...) {
@@ -137,7 +150,7 @@ static void startup(HMODULE self) {
     log_open();
     load_settings();
     VaStats va = va_stats();
-    log("Memory Expansion 1.2 loaded; address space: %llu MB used, %llu MB free (largest block %llu MB)",
+    log("Memory Expansion 1.2.1 loaded; address space: %llu MB used, %llu MB free (largest block %llu MB)",
         va.used >> 20, va.free_total >> 20, va.largest_free >> 20);
     log("already loaded: engine.dll %p, shaderapidx9.dll %p, tier0.dll %p, launcher.dll %p", GetModuleHandleW(L"engine.dll"),
         GetModuleHandleW(L"shaderapidx9.dll"), GetModuleHandleW(L"tier0.dll"), GetModuleHandleW(L"launcher.dll"));
