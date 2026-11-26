@@ -1,0 +1,42 @@
+name: Build and Package
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "[0-9]+.[0-9]+*"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build x86 binaries
+        shell: cmd
+        run: build.cmd
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $ver = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev' }
+          $zip = "dist/MemoryLimitExpansion-$ver.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path @('dist/Bin', 'dist/LICENSE', 'dist/NOTICE') -DestinationPath $zip -CompressionLevel Optimal
+          Get-Item $zip | Select-Object Name, Length
+
+      - name: Upload build artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-limit-expansion
+          path: dist/MemoryLimitExpansion-*.zip
+          if-no-files-found: error
