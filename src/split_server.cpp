@@ -700,6 +700,46 @@ static void restore_changelevel_if_hooked() {
     }
 }
 
+// ---- the world's skill values, for the game ----
+// The world's difficulty settings, sk_* (how much ammo of each kind the player can carry, damage), are
+// vampire.dll variables with the default 0. vampire.dll's CSingleplayRules constructor runs
+// "exec skill<N>.cfg" (vampire.dll 0x101286F0), in this process only. client.dll keeps its own ammo table
+// (client.dll 0x100C8810) that finds the same variables by name, and its inventory, barter and loot screens
+// read how much ammo fits from them (MaxCarry, 0x10079050): whether a weapon's ammo is full (0x1007BD30, which
+// greys out taking or buying ammo) and the total shown. In single player both read the one set of variables;
+// here the game process's copies stayed 0, so a weapon held no more than one clip and no ammo could be taken
+// or bought. The world's sk_* values go to the game ("memx:worldvar <name> <value>", split_client.cpp) when a
+// level is up and within half a second of any change.
+static std::unordered_map<std::string, std::string> s_world_vars_sent;
+static void send_world_vars() {
+    HMODULE vampire = GetModuleHandleW(L"vampire.dll");
+    if (!vampire || !in_module_image(vampire, 0, 1)) return;
+    auto nt = (IMAGE_NT_HEADERS *)((BYTE *)vampire + ((IMAGE_DOS_HEADER *)vampire)->e_lfanew);
+    uintptr_t lo = (uintptr_t)vampire, hi = lo + nt->OptionalHeader.SizeOfImage;
+    // engine.dll's ConCommandBase list (0x20A3F45C): +8 next; +4 the variable (ConVar: +16 name, +32 value)
+    for (BYTE *n = *(BYTE *volatile *)0x20A3F45C; n; n = *(BYTE **)(n + 8)) {
+        if ((uintptr_t)n < lo || (uintptr_t)n >= hi) continue;
+        BYTE *var = *(BYTE **)(n + 4);
+        if (!var) continue;
+        if (((bool(__fastcall *)(void *, void *))(*(void ***)var)[1])(var, nullptr)) continue;   // IsCommand
+        const char *name = *(const char **)(var + 16), *value = *(const char **)(var + 32);
+        if (!name || !value || _strnicmp(name, "sk_", 3) != 0) continue;
+        size_t name_len = strnlen(name, 65), value_len = strnlen(value, 201);
+        if (name_len > 64 || value_len > 200) continue;
+        bool plain = true;
+        for (const char *p = name; *p; ++p) plain &= isalnum((unsigned char)*p) || *p == '_';
+        for (const char *p = value; *p; ++p) plain &= *p != '"' && *p != ';' && (unsigned char)*p >= 0x20;
+        if (!plain) continue;
+        auto it = s_world_vars_sent.find(name);
+        if (it != s_world_vars_sent.end() && it->second == value) continue;
+        char line[300];
+        snprintf(line, sizeof(line), "memx:worldvar %s %s\n", name, value);
+        if (!status_write(line)) return;   // no game to tell (yet): all of them again next time
+        if (g_settings.verbose) log("server: world variable %s \"%s\" to the game", name, value);
+        s_world_vars_sent[name] = value;
+    }
+}
+
 // ---- the launcher interface, replaced ----
 struct LauncherAPI {
     // CEngineAPI::Run(instance, basedir, cmdline, factory); a true result asks the launcher to restart
@@ -772,6 +812,7 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
     s_overflow_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (HANDLE t = CreateThread(nullptr, 0, loop_watch_thread, nullptr, 0, nullptr)) CloseHandle(t);
     DWORD last_alive = 0;
+    DWORD last_world_vars = 0;
     timeBeginPeriod(1);
     // The loop sleeps between world frames until just before the next 1/fps_max deadline (waking
     // immediately if a pipe command arrives). Windows 11 may ignore timeBeginPeriod for a process without
@@ -863,6 +904,13 @@ bool LauncherAPI::Run(void *, char *basedir, char *cmdline, CreateInterfaceFn fa
         // tell the game, which connects to it
         int sv_active = *(volatile int *)0x212B0754;
         int spawn = *(volatile int *)0x212AF1D0;
+        // the world's skill values before "memx:ready", so the game has them when it joins the level
+        if ((sv_active && spawn != reported) || now_tick - last_world_vars >= 500) {
+            last_world_vars = now_tick;
+            s_loop_step = "the world's skill values";
+            send_world_vars();
+            s_loop_step = "after the world frame";
+        }
         if (sv_active && spawn != reported) {
             reported = spawn;
             char line[160];
@@ -1220,6 +1268,65 @@ static int __cdecl server_unknown_text(const char *text) {
     }
     if (g_settings.verbose) log("server: to Python: %.120s", text);
     return ((PyConsole_t)0x200DAB20)(text);
+}
+
+// ---- the player's cheat commands ----
+// "god", "notarget" and "noclip" are vampire.dll commands (FCVAR_GAMEDLL) that act on the player who typed them
+// (UTIL_GetCommandClient, vampire.dll 0x101193B0: the command client the engine set, + 1). In single player the
+// engine runs them as typed and sets that client to the local player first (Cmd_ExecuteString, 0x2002EB4E). Here they
+// come from the game process over the network, and SV_ParseStringCmd (0x200F9800) runs the names on its old list of
+// player commands (0x201AC7B8: status, god, notarget, fly, name, noclip, ...) through Cmd_ExecuteString as from a
+// client, which sets the command client to -1 (no one): the three found no player and did nothing. Every other game
+// command takes SV_ParseStringCmd's own branch for game commands (0x200F987B), which sets the command client to the
+// sender first. This sends the listed names that are game commands that same way; all others run as before.
+static const uintptr_t kServerGameClients = 0x21300C90;   // IServerGameClients * (slot 11: SetCommandClient)
+static const uintptr_t kHostClient = 0x20B42B74;          // client_t *host_client (the sender)
+static const uintptr_t kSvsClients = 0x212AF1D8;          // svs.clients (client_t[], 205008 bytes each)
+static const uintptr_t kServerAliases = 0x203489DC;       // cmdalias_t *: +0 next, +4 name[32]
+typedef int(__cdecl *CmdExecuteString_t)(const char *text, int source);
+static int __cdecl server_listed_client_cmd(const char *text, int source) {
+    const auto execute = (CmdExecuteString_t)0x2002E9F0;
+    if (!text) return execute(text, source);
+    ((void(__cdecl *)(const char *))0x2002E920)(text);   // Cmd_TokenizeString
+    if (((int(__cdecl *)())0x2002E8E0)() < 1) return execute(text, source);
+    const char *name = ((const char *(__cdecl *)(int))0x2002E8F0)(0);
+    // an alias of that name runs as an alias (Cmd_ExecuteString looks at aliases first)
+    for (BYTE *a = *(BYTE *volatile *)kServerAliases; a; a = *(BYTE **)a)
+        if (memchr(a + 4, 0, 32) && !_stricmp((const char *)(a + 4), name)) return execute(text, source);
+    // the engine's command node (0x200400E0): vtable +4 IsCommand, +24 Dispatch; +4 the command (+24 its flags)
+    BYTE *node = ((BYTE *(__cdecl *)(const char *))0x200400E0)(name);
+    void *gc = *(void *volatile *)kServerGameClients;
+    BYTE *cl = *(BYTE *volatile *)kHostClient, *clients = *(BYTE *volatile *)kSvsClients;
+    if (!node || !gc || !cl || !clients || cl < clients || (cl - clients) % 205008) return execute(text, source);
+    BYTE *base = *(BYTE **)(node + 4);
+    if (!base || !((bool(__fastcall *)(void *, void *))(*(void ***)node)[1])(node, nullptr) || !(*(int *)(base + 24) & 4))
+        return execute(text, source);
+    if (g_settings.verbose) log("server: player command %.64s", name);
+    ((void(__fastcall *)(void *, void *, int))(*(void ***)gc)[11])(gc, nullptr, (int)((cl - clients) / 205008));
+    ((void(__fastcall *)(void *, void *))(*(void ***)node)[6])(node, nullptr);
+    return 0;
+}
+// SV_ParseStringCmd's branch for the listed names, from "is game command" to its call of Cmd_ExecuteString:
+// the game-command branch it copies (0x200F9888: host_client, svs.clients, the 205008-byte division, SetCommandClient)
+static const BYTE kGameCmdBranch[] = {0x8B, 0x15, 0x74, 0x2B, 0xB4, 0x20, 0x8B, 0x1D, 0xD8, 0xF1, 0x2A, 0x21, 0x8B, 0x0D,
+                                      0x90, 0x0C, 0x30, 0x21, 0x8B, 0x39, 0x2B, 0xD3, 0xB8, 0x0F, 0x3E, 0xD6, 0x51, 0xF7,
+                                      0xEA, 0xC1, 0xFA, 0x10, 0x8B, 0xC2, 0xC1, 0xE8, 0x1F, 0x03, 0xD0, 0x52, 0xFF, 0x57, 0x2C};
+// ...and the listed-name call itself (0x200F98E6: push 0; push edi; call Cmd_ExecuteString)
+static const BYTE kListedCmdCall[] = {0x6A, 0x00, 0x57, 0xE8};
+static const BYTE kCmdHelpers[][4] = {
+    {0xA1, 0x88, 0x67, 0x34},   // Cmd_Argc 0x2002E8E0: mov eax,[0x20346788]
+    {0x56, 0x8B, 0x35, 0x5C},   // FindCommandBase 0x200400E0: push esi; mov esi,[0x20A3F45C]
+};
+static void install_player_cmds(HMODULE engine) {
+    if (!in_module_image(engine, 0xF9888, sizeof(kGameCmdBranch)) || !in_module_image(engine, 0xF98E6, sizeof(kListedCmdCall)) ||
+        !in_module_image(engine, 0x2E8E0, 4) || !in_module_image(engine, 0x400E0, 4) ||
+        memcmp((BYTE *)engine + 0xF9888, kGameCmdBranch, sizeof(kGameCmdBranch)) != 0 ||
+        memcmp((BYTE *)engine + 0xF98E6, kListedCmdCall, sizeof(kListedCmdCall)) != 0 ||
+        memcmp((BYTE *)engine + 0x2E8E0, kCmdHelpers[0], 4) != 0 || memcmp((BYTE *)engine + 0x400E0, kCmdHelpers[1], 4) != 0) {
+        log("not patched (unknown bytes): server: god/notarget/noclip for the player");
+        return;
+    }
+    redirect_call(engine, 0xF98E9, 0x2E9F0, (void *)server_listed_client_cmd, "server: god/notarget/noclip for the player");
 }
 
 // ---- console output ----
@@ -1861,6 +1968,8 @@ void on_engine_mapped(HMODULE engine) {
     for (const CodePatch &p : kPlayerPatches) apply_patch(engine, p);
     // Cmd_ExecuteString's call of the console's Python (0x2002EC13): commands of the game process go there
     redirect_call(engine, 0x2EC13, 0xDAB20, (void *)server_unknown_text, "server: game commands back to the game");
+    // SV_ParseStringCmd's call of Cmd_ExecuteString for its listed player commands (0x200F98E9)
+    install_player_cmds(engine);
     // Host_RunFrame's call to Host_FilterTime (0x2008E499): verify fps_max read at 0x8BA5F before hooking
     static const BYTE kFpsMaxRead[] = {0x8B, 0x0D, 0x84, 0x28, 0xB4, 0x20, 0x8B, 0x51, 0x28};
     if (in_module_image(engine, 0x8BA5F, sizeof(kFpsMaxRead)) &&

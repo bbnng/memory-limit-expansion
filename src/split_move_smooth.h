@@ -143,7 +143,7 @@ struct MoveTimeline {
             Sample &newest = history[count - 1];
             const double dt = t - newest.t;
             const float dist = distance(pose.org, newest.pose.org);
-            if (teleport || dt < -0.0005 || dist > 48.0f + 2500.0f * (float)(dt > 0.0 ? dt : 0.0) || !finite(pose)) {
+            if (teleport || dt < -0.0005 || dist > 48.0f + reach_speed(vel) * (float)(dt > 0.0 ? dt : 0.0) || !finite(pose)) {
                 restart();
                 if (!finite(pose)) return true;
                 push(t, pose);
@@ -229,6 +229,15 @@ struct MoveTimeline {
     static float distance(const float a[3], const float b[3]) {
         float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
         return sqrtf(x * x + y * y + z * z);
+    }
+
+    // How fast the player can have gone between two snapshots (units a second) before it counts as a teleport:
+    // walking and falling stay under 2500; noclip goes as fast as sv_noclipspeed (2000 by default, any value the
+    // player types), so the player's own speed counts too, with room for acceleration.
+    static float reach_speed(const float vel[3]) {
+        const float speed = vel ? sqrtf(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]) : 0.0f;
+        const float fast = std::isfinite(speed) ? 1.5f * speed : 0.0f;
+        return fast > 2500.0f ? (fast < 30000.0f ? fast : 30000.0f) : 2500.0f;
     }
 
 private:

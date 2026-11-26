@@ -15,7 +15,9 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace memx {
@@ -106,7 +108,7 @@ static void ensure_cs() {
         InitOnceComplete(&s_cs_once, 0, nullptr);
     }
 }
-static std::atomic<uint32_t> s_pending_work{0}; // bit 0: console, 1: cmds, 2: saveclient, 3: preload, 4: infobar
+static std::atomic<uint32_t> s_pending_work{0}; // bit 0: console, 1: cmds, 2: saveclient, 3: preload, 4: infobar, 5: world values
 static std::atomic<bool> s_server_dead{false};  // set by server_input_thread when active server exits
 // Level commands sent to the server are numbered ("memx:loadid"), so that a late report about an earlier
 // one ("memx:loadfailed <number>") can never end the loading screen of the one the player waits for.
@@ -122,6 +124,7 @@ struct InfoBarMsg {
     std::string str;
 };
 static std::vector<InfoBarMsg> s_infobar_msgs;  // HUD InfoBar notices sent by server-side engine.dll (save/autosave/etc.)
+static std::vector<std::pair<std::string, std::string>> s_world_var_msgs;   // the world's sk_* values (name, value)
 static std::string s_save_client_req;           // .HL2 path the server asked this process to write
 static long s_save_client_id;                   // sequence ID for s_save_client_req
 static std::string s_preload_req;               // maps/<name>.bsp the server just started loading
@@ -411,6 +414,17 @@ static void handle_server_line(const ServerConn *conn, const std::string &line, 
                 log("split: warning: client command queue full (500), dropped: %.80s", cmd.c_str());
             }
             LeaveCriticalSection(&s_cs);
+        } else if (line.rfind("memx:worldvar ", 0) == 0) {
+            // one of the world's sk_* values (split_server.cpp, send_world_vars): "<name> <value>"
+            size_t sp = line.find(' ', 14);
+            if (sp != std::string::npos && sp > 14 && sp - 14 <= 64 && line.size() - sp - 1 <= 200) {
+                EnterCriticalSection(&s_cs);
+                if (s_world_var_msgs.size() < 1000) {
+                    s_world_var_msgs.emplace_back(line.substr(14, sp - 14), line.substr(sp + 1));
+                    s_pending_work.fetch_or(32u, std::memory_order_release);
+                }
+                LeaveCriticalSection(&s_cs);
+            }
         } else if (line.rfind("memx:infobar ", 0) == 0) {
             const char *p = line.c_str() + 13;
             char *end1 = nullptr, *end2 = nullptr;
@@ -822,8 +836,30 @@ struct SyncedVar {
 };
 static std::vector<SyncedVar> s_synced;
 static bool s_synced_built;
+// The world's own values of its sk_* variables (split_server.cpp, send_world_vars), set here as they come
+// (main thread). A variable that took such a value is not sent back: the server already has it.
+static std::unordered_map<std::string, std::string> s_world_values;
+// vampire.dll's replicated variables (0x2000: sv_noclipspeed, sv_gravity, vdiscipline_allow_renewables, ...). Single
+// player sets them where the world reads them; here the server's values come back over the network and overwrite
+// this process's copies, and the engine refuses a change typed while connected ("Can't change replicated ConVar").
+// What goes: the player's own value (config.cfg, as it stands before the first game; the Unofficial Patch's
+// sv_noclipspeed "1000"), and later each value typed while playing (split_replicated_refused). sv_skyname is the
+// level's.
+struct ReplicatedVar {
+    BYTE *var;
+    std::string player;   // the player's value
+    std::string sent;     // the value the server has from us (its default before the first send)
+};
+static std::vector<ReplicatedVar> s_replicated;
 static void forget_sent_settings() {
     for (SyncedVar &s : s_synced) s.sent = *(const char **)(s.var + 28);
+    for (ReplicatedVar &r : s_replicated) r.sent = *(const char **)(r.var + 28);
+}
+// a variable's value as the game reads it: its parent's (+4; the engine links the same name in client.dll and
+// vampire.dll)
+static const char *var_value(BYTE *var) {
+    BYTE *parent = *(BYTE **)(var + 4);
+    return *(const char **)((parent ? parent : var) + 32);
 }
 
 static bool has_ctl_or_space(const char *s, bool forbid_space) {
@@ -851,23 +887,80 @@ static void sync_settings() {
             if (((bool(__fastcall *)(void *, void *))(*(void ***)var)[1])(var, nullptr)) continue;
             const char *name = *(const char **)(var + 16), *def = *(const char **)(var + 28);
             if (!name || !def || has_ctl_or_space(name, true)) continue;
-            // replicated variables (0x2000, sv_skyname, ...) come from the server: never sent back
-            if (*(int *)(var + 24) & 0x2000) continue;
+            // replicated variables (0x2000) come from the server: never sent back; only the player's own values
+            // of vampire.dll's (see ReplicatedVar), as they stand now, before the first game
+            if (*(int *)(var + 24) & 0x2000) {
+                const char *value = var_value(var);
+                if ((uintptr_t)n >= lo && (uintptr_t)n < hi && _stricmp(name, "sv_skyname") != 0 && value &&
+                    seen_vars.insert(var).second)
+                    s_replicated.push_back({var, value, def});
+                continue;
+            }
             bool engine_setting = false;
             for (const char *e : kEngineSettings) engine_setting |= !_stricmp(name, e);
             if ((engine_setting || ((uintptr_t)n >= lo && (uintptr_t)n < hi)) && seen_vars.insert(var).second)
                 s_synced.push_back({var, def});
         }
-        log("split: %u settings follow the game to the server process", (unsigned)s_synced.size());
+        log("split: %u settings follow the game to the server process (and the player's own values of %u replicated ones)",
+            (unsigned)s_synced.size(), (unsigned)s_replicated.size());
+    }
+    for (ReplicatedVar &r : s_replicated) {
+        if (r.player == r.sent || has_ctl_or_space(r.player.c_str(), false) || r.player.size() > 200) continue;
+        r.sent = r.player;
+        const char *name = *(const char **)(r.var + 16);
+        if (g_settings.verbose) log("split: setting %s \"%s\" (replicated)", name, r.player.c_str());
+        to_server(std::string(name) + " \"" + r.player + "\"");
     }
     for (SyncedVar &s : s_synced) {
         const char *value = *(const char **)(s.var + 32);
         if (!value || strcmp(s.sent.c_str(), value) == 0 || has_ctl_or_space(value, false) || strlen(value) > 200) continue;
         const char *name = *(const char **)(s.var + 16);
+        auto world = s_world_values.find(name);
+        if (world != s_world_values.end() && world->second == value) {
+            s.sent = value;
+            continue;
+        }
         s.sent = value;
         if (g_settings.verbose) log("split: setting %s \"%s\"", name, value);
         to_server(std::string(name) + " \"" + value + "\"");
     }
+}
+
+// The world's sk_* values in this process's copies of vampire.dll's variables, which client.dll's ammo table
+// reads (how much ammo fits: the inventory, barter and loot screens). Main thread.
+static void apply_world_vars(const std::vector<std::pair<std::string, std::string>> &vars) {
+    HMODULE vampire = GetModuleHandleW(L"vampire.dll");
+    if (!vampire || !in_module_image(vampire, 0, 1)) return;
+    auto nt = (IMAGE_NT_HEADERS *)((BYTE *)vampire + ((IMAGE_DOS_HEADER *)vampire)->e_lfanew);
+    uintptr_t lo = (uintptr_t)vampire, hi = lo + nt->OptionalHeader.SizeOfImage;
+    std::unordered_map<std::string, BYTE *> known;   // lower-case name -> vampire.dll's sk_* variable
+    for (BYTE *n = *(BYTE **)kCommandList; n; n = *(BYTE **)(n + 8)) {
+        if ((uintptr_t)n < lo || (uintptr_t)n >= hi) continue;
+        BYTE *var = *(BYTE **)(n + 4);
+        if (!var || ((bool(__fastcall *)(void *, void *))(*(void ***)var)[1])(var, nullptr)) continue;   // IsCommand
+        const char *name = *(const char **)(var + 16);
+        if (!name || _strnicmp(name, "sk_", 3) != 0 || strnlen(name, 65) > 64) continue;
+        std::string key(name);
+        for (char &ch : key) ch = (char)tolower((unsigned char)ch);
+        known.emplace(std::move(key), var);
+    }
+    int set = 0;
+    for (const auto &v : vars) {
+        std::string key(v.first);
+        for (char &ch : key) ch = (char)tolower((unsigned char)ch);
+        auto it = known.find(key);
+        if (it == known.end() || has_ctl_or_space(v.second.c_str(), false)) {
+            if (g_settings.verbose) log("split: world variable %.64s is not one of this process's: left out", v.first.c_str());
+            continue;
+        }
+        const char *name = *(const char **)(it->second + 16);
+        s_world_values[name] = v.second;
+        const char *now = *(const char **)(it->second + 32);
+        if (now && v.second == now) continue;
+        Cbuf_AddText((std::string(name) + " \"" + v.second + "\"\n").c_str());
+        ++set;
+    }
+    if (set && g_settings.verbose) log("split: %d of the world's skill values set in this process", set);
 }
 
 static int send_command_names();
@@ -1155,6 +1248,38 @@ static int __cdecl split_forward_to_server(char reliable) {
     }
     return ((int(__cdecl *)(char))0x2002EC20)(reliable);
 }
+
+// Cvar_Command (0x20044030) refuses a new value for a replicated variable while this process plays on a server it
+// does not run: its call of Con_Printf with "Can't change replicated ConVar %s from console of client, only server
+// operator can change its value" (0x20044122). In single player the value is set where the world reads it (and the
+// player's noclip speed, gravity, ... change); here it goes to the server process, whose engine sends it back to this
+// one as for any replicated variable. The command is still tokenized: Cmd_Argv(1...) is the new value.
+static void __cdecl split_replicated_refused(const char *fmt, const char *name) {
+    if (name && s_want_game && server_usable() && Cmd_Argc() >= 2 && strlen(name) <= 64 && !has_ctl_or_space(name, true) &&
+        _strnicmp(name, "memx:", 5) != 0) {
+        // the value as Cvar_Command makes it: the arguments joined by spaces, without trailing spaces
+        std::string value;
+        for (int i = 1; i < Cmd_Argc(); ++i) {
+            const char *v = Cmd_Argv(i);
+            if (i > 1) value += ' ';
+            if (v) value += v;
+        }
+        while (!value.empty() && value.back() == ' ') value.pop_back();
+        if (!has_ctl_or_space(value.c_str(), false) && value.size() <= 200) {
+            for (ReplicatedVar &r : s_replicated) {
+                if (_stricmp(*(const char **)(r.var + 16), name) != 0) continue;
+                r.player = value;   // also for the next server process (single player keeps it until the game quits)
+                r.sent = value;
+            }
+            log("split: %s \"%s\" (replicated) to the server process", name, value.c_str());
+            to_server(std::string(name) + " \"" + value + "\"");
+            return;
+        }
+    }
+    Con_Printf(fmt, name);
+}
+// Cvar_Command's refusal: push eax (the name); push "Can't change replicated ConVar..." (0x2019CFD0); call Con_Printf
+static const BYTE kReplicatedRefusal[] = {0x50, 0x68, 0xD0, 0xCF, 0x19, 0x20, 0xE8};
 
 // The spread multiplier the plugin's view worked out (1.0 without sights) is for the world's weapons.
 static DWORD s_iron_spread_sent = kIronSightsNoSpreadChange;   // what the server process has (a new one: 1.0)
@@ -1788,20 +1913,23 @@ static void __cdecl client_frame() {
         uint32_t work = s_pending_work.load(std::memory_order_acquire);
         bool can_run_cmds = (*(volatile int *)kClsState == 4) && local_player_ready();
         // A notice waits for the game screen too: its few seconds would pass unseen under the loading screen.
-        uint32_t drain_mask = 5u | (can_run_cmds ? 18u : 0u);
+        uint32_t drain_mask = 37u | (can_run_cmds ? 18u : 0u);
         if (work & drain_mask) {
             std::vector<std::string> lines, cmds;
             std::vector<InfoBarMsg> infobars;
+            std::vector<std::pair<std::string, std::string>> world_vars;
             std::string save_client;
             long save_id = 0;
             EnterCriticalSection(&s_cs);
             lines.swap(s_to_console);
             if (can_run_cmds) cmds.swap(s_from_server);
             if (can_run_cmds) infobars.swap(s_infobar_msgs);
+            world_vars.swap(s_world_var_msgs);
             save_client.swap(s_save_client_req);
             save_id = s_save_client_id;
             s_pending_work.fetch_and(~drain_mask, std::memory_order_release);
             LeaveCriticalSection(&s_cs);
+            if (!world_vars.empty()) apply_world_vars(world_vars);
             for (const InfoBarMsg &m : infobars) show_infobar_msg(m);
             if (!save_client.empty()) {
                 int saved_ok = 0;
@@ -2167,6 +2295,7 @@ void install_split_client(HMODULE engine) {
     ensure_cs();
     // Reset per-mapping cached pointers in case engine.dll was unloaded and remapped (engine restart).
     s_synced.clear();
+    s_replicated.clear();
     s_synced_built = false;
     s_sent_commands = false;
     s_sent_names = 0;
@@ -2237,6 +2366,11 @@ void install_split_client(HMODULE engine) {
         redirect_call(engine, 0x968D9, 0xF8870, (void *)split_restore_precache_decal, "split: restore map decals");
     redirect_call(engine, 0x2EC13, 0xDAB20, (void *)split_python, "split: console Python to the server");
     redirect_call(engine, 0x2EB99, 0x2EC20, (void *)split_forward_to_server, "split: iron sights commands in this process");
+    if (in_module_image(engine, 0x4411C, sizeof(kReplicatedRefusal)) &&
+        memcmp((BYTE *)engine + 0x4411C, kReplicatedRefusal, sizeof(kReplicatedRefusal)) == 0)
+        redirect_call(engine, 0x44122, 0x3F290, (void *)split_replicated_refused, "split: replicated variables to the server");
+    else
+        log("not patched (unknown bytes): split: replicated variables to the server");
     // CL_ClearState's three callers (CL_Disconnect, CL_ParseServerInfo, Host_Disconnect's helper)
     redirect_call(engine, 0x26879, 0x26570, (void *)split_clear_state, "split: static props released (disconnect)");
     redirect_call(engine, 0x2B263, 0x26570, (void *)split_clear_state, "split: static props released (new level)");
